@@ -141,37 +141,48 @@
   </tr>
 </table>
 
-<table>
-  <tr>
-    <td width="50%" valign="top">
-      <strong>员工账号与多部门成员关系</strong><br/><br/>
-      <img src="docs/screenshots/runtime/department-accounts.png" alt="员工账号与多部门关系" />
-      <br/>支持员工加入多个部门，并维护账号与组织关系。
-    </td>
-    <td width="50%" valign="top">
-      <strong>排班与员工请假记录</strong><br/><br/>
-      <img src="docs/screenshots/runtime/employee-schedule-leave.png" alt="员工排班与请假记录" />
-      <br/>员工工作时间、请假状态与历史记录可以统一追踪。
-    </td>
-  </tr>
-</table>
+### 员工账号与多部门关系
 
-## 2. 考勤、排班与薪酬自动化
+![员工账号与多部门关系](docs/screenshots/runtime/department-accounts.png)
 
-<table>
-  <tr>
-    <td width="50%" valign="top">
-      <strong>排班与考勤管理</strong><br/><br/>
-      <img src="docs/screenshots/runtime/schedule-attendance-admin.png" alt="排班与考勤管理" />
-      <br/>统一维护假期、考勤记录、员工状态并处理请假申请。
-    </td>
-    <td width="50%" valign="top">
-      <strong>薪酬与发薪规则</strong><br/><br/>
-      <img src="docs/screenshots/runtime/payroll-cycle.png" alt="薪酬与发薪规则" />
-      <br/>配置发薪日和提前生成周期，并生成工资批次进入后续流程。
-    </td>
-  </tr>
-</table>
+支持员工加入多个部门，并维护账号、角色和组织关系。
+
+---
+
+## 2. 请假、排班与考勤联动
+
+这一部分不是单独做一个“请假记录页面”，而是把 **员工工作时间、请假审批和实际排班状态** 串到一起。
+
+### 员工排班
+
+![员工排班](docs/screenshots/runtime/employee-schedule.png)
+
+管理员可以按员工维护每周工作日与上下班时间，不同员工可以配置不同的工作周期。
+
+### 请假审批与历史记录
+
+![请假审批与历史记录](docs/screenshots/runtime/leave-approval.png)
+
+请假申请会保留 **员工、请假类型、日期区间、原因和审批状态**。审批通过后，结果会继续影响员工实际工作安排，避免“请假系统”和“排班系统”各自独立。
+
+**这一条业务链路可以概括为：自然语言发起请假 → 解析请假信息 → 用户确认 → 审批 → 同步员工排班 / 历史记录。**
+
+这也是项目智能化比较重要的一点：AI 不只是回答“怎么请假”，而是能够把用户表达继续转换为真实业务数据，再进入审批与排班流程。
+
+### 管理端考勤与请假处理
+
+![排班与考勤管理](docs/screenshots/runtime/schedule-attendance-admin.png)
+
+管理端可以统一查看假期、考勤、员工状态和请假申请，把员工时间管理集中到同一个业务入口。
+
+## 3. 薪酬自动化
+
+<p align="center">
+  <strong>薪酬与发薪规则</strong><br/><br/>
+  <img src="docs/screenshots/runtime/payroll-cycle.png" alt="薪酬与发薪规则" width="100%" />
+</p>
+
+配置发薪日和提前生成周期，并生成工资批次进入后续费用、审批与付款流程。
 
 <table>
   <tr>
@@ -188,7 +199,7 @@
   </tr>
 </table>
 
-## 3. 费用、审批与经营闭环
+## 4. 费用、审批与经营闭环
 
 <table>
   <tr>
@@ -212,7 +223,7 @@
 
 驾驶舱展示费用状态分布和月度趋势，点击状态或月份后可继续进入明细页面处理。
 
-## 4. 协作、工单与待办
+## 5. 协作、工单与待办
 
 <table>
   <tr>
@@ -229,7 +240,7 @@
   </tr>
 </table>
 
-## 5. 项目、合同与知识资产
+## 6. 项目、合同与知识资产
 
 <table>
   <tr>
@@ -253,7 +264,7 @@
 
 文档可按部门、项目、合同和敏感性进行管理，并作为 AI 检索时的授权知识范围。
 
-## 6. 安全、敏感治理与审计
+## 7. 安全、敏感治理与审计
 
 <table>
   <tr>
