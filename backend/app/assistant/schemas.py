@@ -29,6 +29,9 @@ class ActionPreview(BaseModel):
     summary: str
     changes: list[ActionChange] = Field(default_factory=list)
     confirmation_phrase: str | None = None
+    requires_confirmation: bool = True
+    confirmation_step: int = 0
+    confirmation_steps_required: int = 1
     expires_at: datetime | None = None
     parameter_hash: str | None = None
 

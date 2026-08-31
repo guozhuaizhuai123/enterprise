@@ -1,14 +1,21 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from fastapi import HTTPException
+from pydantic import BaseModel
 from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.db import Base
+from app.assistant.planner import ActionPlan
+from app.assistant import registry
+from app.assistant.registry import ActionDefinition, get_action
 from app.assistant.schemas import ActionChange, ActionPreview, ActionResult
-from app.models import AssistantAction
+from app.assistant.service import create_preview
+from app.deps import Principal
+from app.models import AssistantAction, AuditLog, Project
 
 
 @pytest.fixture
@@ -24,6 +31,130 @@ def db():
         session.close()
         Base.metadata.drop_all(engine)
         engine.dispose()
+
+
+def _principal(*, role="admin", department_ids=("dept-a",)):
+    return Principal(
+        user_id="admin",
+        username="administrator",
+        role=role,
+        department_id=department_ids[0] if department_ids else None,
+        department_ids=department_ids,
+    )
+
+
+def _plan(action_name, payload):
+    action = get_action(action_name)
+    assert action is not None
+    return ActionPlan(action=action, input=action.input_model.model_validate(payload))
+
+
+def test_create_preview_persists_metadata_with_five_minute_ttl_without_business_entity(db):
+    """Removing preview persistence or calling the action handler would lose auditability or create a project."""
+    before = datetime.now(timezone.utc)
+
+    preview = create_preview(
+        db,
+        _principal(),
+        "thread-1",
+        _plan("create_project", {"code": "KB-1", "name": "知识库"}),
+    )
+
+    action = db.get(AssistantAction, preview.action_id)
+    assert action is not None
+    assert action.status == "preview"
+    assert action.payload_json == {"code": "KB-1", "name": "知识库", "type": "internal", "status": "preparing", "department_id": None, "manager_id": None, "start_date": None, "end_date": None, "budget": None, "description": ""}
+    assert action.preview_json["confirmation_phrase"] == "确认执行"
+    assert action.parameter_hash == preview.parameter_hash
+    assert action.expires_at is not None
+    assert abs((preview.expires_at - before).total_seconds() - 300) < 2
+    assert db.query(Project).count() == 0
+    assert db.query(AuditLog).filter(AuditLog.action == "assistant_action_previewed").count() == 1
+
+
+def test_create_preview_hash_is_stable_for_semantic_json_and_bound_to_department_scope(db):
+    """Dropping canonical JSON or department scope from the hash would allow stale confirmation reuse."""
+    first = create_preview(
+        db,
+        _principal(department_ids=("dept-b", "dept-a")),
+        "thread-1",
+        _plan("create_project", {"name": "知识库", "code": "KB-1"}),
+    )
+    second = create_preview(
+        db,
+        _principal(department_ids=("dept-a", "dept-b")),
+        "thread-1",
+        _plan("create_project", {"code": "KB-1", "name": "知识库"}),
+    )
+    other_scope = create_preview(
+        db,
+        _principal(department_ids=("dept-c",)),
+        "thread-1",
+        _plan("create_project", {"code": "KB-1", "name": "知识库"}),
+    )
+
+    assert first.parameter_hash == second.parameter_hash
+    assert first.parameter_hash != other_scope.parameter_hash
+
+
+def test_create_preview_rejects_role_mismatch_before_persistence(db):
+    """Removing the service-side role check would let a forged plan persist a privileged preview."""
+    with pytest.raises(HTTPException) as exc_info:
+        create_preview(
+            db,
+            _principal(role="employee"),
+            "thread-1",
+            _plan("create_org_unit", {"name": "研发", "code": "RND"}),
+        )
+
+    assert getattr(exc_info.value, "status_code", None) == 403
+    assert db.query(AssistantAction).count() == 0
+
+
+def test_create_preview_audit_redacts_secret_shaped_payload_keys(db, monkeypatch):
+    """Passing raw secrets to audit metadata would expose them in the audit log."""
+    class SecretPayload(BaseModel):
+        api_token: str
+        label: str
+
+    action = ActionDefinition(
+        name="create_project",
+        input_model=SecretPayload,
+        required_roles=("admin",),
+        risk_level="high",
+        preview=lambda: None,
+        execute=lambda: None,
+    )
+    monkeypatch.setitem(registry._ACTION_BY_NAME, action.name, action)
+
+    preview = create_preview(
+        db,
+        _principal(),
+        "thread-1",
+        ActionPlan(action=action, input=SecretPayload(api_token="top-secret", label="知识库")),
+    )
+
+    audit = db.query(AuditLog).filter(AuditLog.entity_id == preview.action_id).one()
+    assert audit.after_data["payload"] == {"api_token": "[REDACTED]", "label": "知识库"}
+
+
+@pytest.mark.parametrize(
+    ("action_name", "payload", "phrase", "requires_confirmation", "steps"),
+    [
+        ("list_projects", {}, None, False, 0),
+        ("search_knowledge", {}, "确认查看", True, 1),
+        ("create_org_unit", {"name": "研发", "code": "RND"}, "确认执行", True, 1),
+        ("generate_payroll", {}, "确认批量执行", True, 2),
+    ],
+)
+def test_create_preview_applies_confirmation_policy(action_name, payload, phrase, requires_confirmation, steps, db):
+    """Changing a risk policy branch must change the preview's confirmation metadata."""
+    preview = create_preview(db, _principal(), "thread-1", _plan(action_name, payload))
+
+    assert preview.confirmation_phrase == phrase
+    assert preview.requires_confirmation is requires_confirmation
+    assert preview.confirmation_step == 0
+    assert preview.confirmation_steps_required == steps
 
 
 def test_action_preview_stores_hash_and_expires(db):
