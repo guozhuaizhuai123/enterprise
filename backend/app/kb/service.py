@@ -91,8 +91,8 @@ def create_document(
     uploaded_by: str,
     owner_id: str,
     owner_name: str,
-    project_id: str | None | object = _UNSET,
-    contract_id: str | None | object = _UNSET,
+    project_id: str | None = None,
+    contract_id: str | None = None,
 ) -> Document:
     document = Document(
         department_id=department_id,
@@ -123,8 +123,8 @@ def update_document(
     content: str | None = None,
     owner_id: str | None = None,
     owner_name: str | None = None,
-    project_id: str | None = None,
-    contract_id: str | None = None,
+    project_id: str | None | object = _UNSET,
+    contract_id: str | None | object = _UNSET,
 ) -> Document:
     if title is not None:
         document.title = title

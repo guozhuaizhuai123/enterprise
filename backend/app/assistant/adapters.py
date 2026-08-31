@@ -504,25 +504,58 @@ def _delete_contract(s,p,x):
     project_contract_service.delete_contract(s, row)
     return {"id":x["id"],"deleted":True}
 def _create_document(s,p,x):
-    if s.get(Department,x["department_id"]) is None: raise HTTPException(404,"department not found")
-    if x.get("project_id") and s.get(Project,x["project_id"]) is None: raise HTTPException(400,"project not found")
-    if x.get("contract_id"):
-        contract=s.get(Contract,x["contract_id"])
-        if contract is None: raise HTTPException(400,"contract not found")
-        if contract.project_id and x.get("project_id") and contract.project_id != x["project_id"]: raise HTTPException(400,"contract belongs to another project")
-    data={k:v for k,v in x.items() if k!="department_id"}; row=Document(department_id=x["department_id"],uploaded_by=p.user_id,owner_id=p.user_id,owner_name=p.username,**data); s.add(row); s.flush(); _index_document(s,row); return {"id":row.id,"title":row.title,"department_id":row.department_id}
+    department_id = str(x["department_id"])
+    kb_service.require_department(s, department_id)
+    payload = DocumentCreate.model_validate({key: value for key, value in x.items() if key != "department_id"})
+    owner = s.get(User, payload.owner_id or p.user_id)
+    if owner is None:
+        raise HTTPException(400, "owner not found")
+    project_id, contract_id = kb_service.resolve_document_links(s, payload.project_id, payload.contract_id)
+    row = kb_service.create_document(
+        s,
+        department_id=department_id,
+        title=payload.title,
+        category=payload.category,
+        sensitive=payload.sensitive,
+        content=payload.content,
+        uploaded_by=p.user_id,
+        owner_id=owner.id,
+        owner_name=owner.username,
+        project_id=project_id,
+        contract_id=contract_id,
+    )
+    return {"id": row.id, "title": row.title, "department_id": row.department_id, "category": row.category, "sensitive": row.sensitive, "owner_id": row.owner_id, "project_id": row.project_id, "contract_id": row.contract_id}
 def _update_document(s,p,x):
     row=s.get(Document,x["id"])
     if row is None: raise HTTPException(404,"document not found")
-    changed=False
-    for k,v in x.items():
-        if k!="id" and v is not None and hasattr(row,k): setattr(row,k,v); changed=changed or k=="content"
-    if changed: _index_document(s,row)
-    s.flush(); return {"id":row.id,"title":row.title,"department_id":row.department_id}
+    payload = DocumentUpdate.model_validate({key: value for key, value in x.items() if key != "id"})
+    project_id = payload.project_id if "project_id" in payload.model_fields_set else row.project_id
+    contract_id = payload.contract_id if "contract_id" in payload.model_fields_set else row.contract_id
+    project_id, contract_id = kb_service.resolve_document_links(s, project_id, contract_id)
+    owner_name = None
+    if payload.owner_id is not None:
+        owner = s.get(User, payload.owner_id)
+        if owner is None:
+            raise HTTPException(400, "owner not found")
+        owner_name = owner.username
+    row = kb_service.update_document(
+        s,
+        row,
+        title=payload.title,
+        category=payload.category,
+        sensitive=payload.sensitive,
+        content=payload.content,
+        owner_id=payload.owner_id,
+        owner_name=owner_name,
+        project_id=project_id,
+        contract_id=contract_id,
+    )
+    return {"id": row.id, "title": row.title, "department_id": row.department_id, "category": row.category, "sensitive": row.sensitive, "owner_id": row.owner_id, "project_id": row.project_id, "contract_id": row.contract_id}
 def _delete_document(s,p,x):
     row=s.get(Document,x["id"])
     if row is None: raise HTTPException(404,"document not found")
-    s.delete(row); s.flush(); return {"id":x["id"],"deleted":True}
+    kb_service.delete_document(s, row)
+    return {"id":x["id"],"deleted":True}
 
 def _create_expense(s,p,x):
     row=ExpenseService.create_draft(s,requester_id=p.user_id,title=x["title"],purpose=x.get("purpose", ""),project_code=x.get("project_code", ""),currency=x.get("currency","CNY"),expected_total=x.get("total_amount"),items=x["items"]); return {"id":row.id,"claim_no":row.claim_no,"status":row.status}

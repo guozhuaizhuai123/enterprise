@@ -124,7 +124,12 @@ def create_preview(db: Session, principal: Principal, thread_id: str | None, pla
     except (AttributeError, ValidationError) as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "assistant action payload is invalid") from exc
 
-    payload = _normalize_json(validated_input)
+    # Updates need to distinguish an omitted optional field from an explicit
+    # null (for example, unlinking a project).  Target-bound actions preserve
+    # that field set while create actions retain their existing defaults.
+    payload = _normalize_json(
+        validated_input.model_dump(mode="python", exclude_unset=definition.target_model is not None)
+    )
     object_versions = _object_versions(db, definition, payload)
     parameter_hash = _parameter_hash(definition.name, payload, principal.department_ids, object_versions)
     confirmation_phrase, requires_confirmation, confirmation_steps_required = _CONFIRMATION_POLICY[
