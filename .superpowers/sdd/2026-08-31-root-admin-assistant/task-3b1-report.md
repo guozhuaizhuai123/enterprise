@@ -135,3 +135,33 @@ $ /Users/guozhuaizhuai/Desktop/enterprise-kb-system/backend/.venv/bin/python -m 
 $ /Users/guozhuaizhuai/Desktop/enterprise-kb-system/backend/.venv/bin/python -m pytest -q
 218 passed, 11 warnings, 3 subtests passed in 6.04s
 ```
+
+## Final approval-department correction
+
+Approval department scope again follows the exact existing ordering rule using
+only correlated scalar expressions: select the first task's `department_id`
+ordered by `(sequence, id)`, then fall back to the requester's department.
+The same expression supplies both the result field and optional department
+filter, without loading or ranking task history into memory.
+
+### Final RED
+
+```text
+1 failed, 12 passed
+expected cross-department approval department_id 'dept-b'; received requester department 'dept-a'
+```
+
+### Final GREEN
+
+```text
+$ /Users/guozhuaizhuai/Desktop/enterprise-kb-system/backend/.venv/bin/python -m pytest tests/test_assistant_adapters.py -q
+.............                                                            [100%]
+13 passed, 11 warnings in 2.82s
+```
+
+### Final full suite
+
+```text
+$ /Users/guozhuaizhuai/Desktop/enterprise-kb-system/backend/.venv/bin/python -m pytest -q
+219 passed, 11 warnings, 3 subtests passed in 5.49s
+```

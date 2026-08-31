@@ -444,3 +444,30 @@ def test_approval_list_omits_unbounded_task_history_but_keeps_department(db):
     assert item["requester_name"] == "requester"
     assert "tasks" not in item
     assert not any("ROW_NUMBER" in statement for statement in statements)
+
+
+def test_approval_department_uses_the_first_task_before_requester_fallback(db):
+    """Replacing first-task scope with requester scope would mislabel and misfilter cross-department approvals."""
+    from app.assistant.adapters import install_production_adapters
+
+    db.add_all([
+        Department(id="dept-a", name="研发", code="RND"),
+        Department(id="dept-b", name="财务", code="FIN"),
+        User(id="requester", username="requester", password_encrypted="secret", role="employee", department_id="dept-a"),
+        WorkflowDefinition(id="flow-1", code="flow-1", name="审批流", version=1, active=True),
+        WorkflowNode(id="node-1", definition_id="flow-1", sequence=1, name="审批", assignee_type="role", assignee_role="finance"),
+        ApprovalInstance(id="approval-1", definition_id="flow-1", entity_type="expense_claim", entity_id="expense-1", requester_id="requester"),
+        ApprovalTask(id="task-first", instance_id="approval-1", node_id="node-1", sequence=1, assignee_role="finance", department_id="dept-b"),
+        ApprovalTask(id="task-later", instance_id="approval-1", node_id="node-1", sequence=2, assignee_role="finance", department_id="dept-a"),
+    ])
+    db.flush()
+    install_production_adapters()
+    root = _principal(user_id="root")
+
+    all_departments = _adapter("list_approvals")(db, root, _payload("list_approvals"))
+    finance = _adapter("list_approvals")(db, root, _payload("list_approvals", department_id="dept-b"))
+    engineering = _adapter("list_approvals")(db, root, _payload("list_approvals", department_id="dept-a"))
+
+    assert all_departments["items"][0]["department_id"] == "dept-b"
+    assert [item["id"] for item in finance["items"]] == ["approval-1"]
+    assert engineering["items"] == []

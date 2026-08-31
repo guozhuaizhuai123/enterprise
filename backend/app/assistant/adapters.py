@@ -9,7 +9,7 @@ from decimal import Decimal
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import exists, or_, select
+from sqlalchemy import exists, func, or_, select
 
 from app.access import resolve_department_scope
 from app.assistant.service import register_action_adapter
@@ -273,11 +273,19 @@ def _list_expenses(session: Any, principal: Principal, payload: dict[str, Any]) 
 
 
 def _approval_department_expression() -> Any:
-    return (
+    first_task_department = (
+        select(ApprovalTask.department_id)
+        .where(ApprovalTask.instance_id == ApprovalInstance.id)
+        .order_by(ApprovalTask.sequence, ApprovalTask.id)
+        .limit(1)
+        .scalar_subquery()
+    )
+    requester_department = (
         select(User.department_id)
         .where(User.id == ApprovalInstance.requester_id)
         .scalar_subquery()
     )
+    return func.coalesce(first_task_department, requester_department)
 
 
 def _approval_requester_name_expression() -> Any:
