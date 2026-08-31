@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from fastapi import HTTPException
@@ -15,7 +15,7 @@ from app.assistant.registry import ActionDefinition, get_action
 from app.assistant.schemas import ActionChange, ActionPreview, ActionResult
 from app.assistant.service import create_preview
 from app.deps import Principal
-from app.models import AssistantAction, AuditLog, Project
+from app.models import AssistantAction, AuditLog, ExpenseClaim, Project
 
 
 @pytest.fixture
@@ -95,6 +95,38 @@ def test_create_preview_hash_is_stable_for_semantic_json_and_bound_to_department
 
     assert first.parameter_hash == second.parameter_hash
     assert first.parameter_hash != other_scope.parameter_hash
+
+
+def test_create_preview_binds_hash_to_current_supported_object_version(db):
+    """Removing object-version binding would allow confirmation after the expense changed."""
+    expense = ExpenseClaim(
+        id="expense-1",
+        claim_no="EXP-001",
+        requester_id="admin",
+        title="差旅行程",
+    )
+    db.add(expense)
+    db.flush()
+    payload = {
+        "id": expense.id,
+        "payment_date": date(2026, 8, 31),
+        "method": "bank_transfer",
+        "idempotency_key": "payment-key-1",
+        "expected_version": 1,
+    }
+
+    first = create_preview(db, _principal(), "thread-1", _plan("pay_expense", payload))
+    expense.version = 2
+    db.flush()
+    second = create_preview(db, _principal(), "thread-1", _plan("pay_expense", payload))
+
+    first_action = db.get(AssistantAction, first.action_id)
+    second_action = db.get(AssistantAction, second.action_id)
+    assert first_action is not None
+    assert second_action is not None
+    assert first_action.object_versions_json == {"expense-1": 1}
+    assert second_action.object_versions_json == {"expense-1": 2}
+    assert first.parameter_hash != second.parameter_hash
 
 
 def test_create_preview_rejects_role_mismatch_before_persistence(db):
