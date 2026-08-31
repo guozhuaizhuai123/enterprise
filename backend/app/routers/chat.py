@@ -9,6 +9,10 @@ from app.access import resolve_department_scope
 from app.db import SessionLocal, get_db
 from app.deps import Principal, get_current_principal
 from app.models import Department, Document, Message, SensitiveKeyword, Thread, UserChatSetting
+from app.assistant.adapters import install_production_adapters
+from app.assistant.planner import ActionPlan, plan_input
+from app.assistant.service import cancel_action, confirm_action, create_preview
+from app.assistant.schemas import ActionConfirmRequest
 from app.context.service import (
     ensure_thread_context_setting,
     get_thread_context,
@@ -29,7 +33,7 @@ async def ask(
     principal: Principal = Depends(get_current_principal),
 ):
     try:
-        department_ids = resolve_department_scope(principal.department_ids, payload.department_ids)
+        department_ids = resolve_department_scope(principal.department_ids, payload.department_ids, is_root=principal.role == "admin", db=db)
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except PermissionError as exc:
@@ -73,6 +77,16 @@ async def ask(
     elif not is_new_thread:
         ensure_thread_context_setting(db, thread)
 
+    action_plan = plan_input(payload.question, principal, db)
+    if isinstance(action_plan, ActionPlan):
+        preview = create_preview(db, principal, thread.id, action_plan)
+        db.commit()
+        async def action_events():
+            yield {"event":"message","data":json.dumps({"node":"thread","status":"ready","thread_id":thread.id}, ensure_ascii=False)}
+            yield {"event":"message","data":json.dumps({"node":"action_preview","status":"ready", **preview.model_dump(mode="json")}, ensure_ascii=False)}
+            yield {"event":"message","data":"[DONE]"}
+        return EventSourceResponse(action_events())
+
     context = get_thread_context(db, thread)
     scope = resolve_document_scope_state(db, principal=principal, thread=thread)
     current_message = Message(thread_id=thread.id, role="user", content=payload.question)
@@ -109,7 +123,7 @@ async def ask(
     )
     user_id = principal.user_id
     username = principal.username
-    authorized_department_ids = tuple(principal.department_ids)
+    authorized_department_ids = tuple(department_ids)
     document_scope_mode = context.document_scope_mode
     selected_document_ids = scope.document_ids
     scope_adjusted = scope.adjusted
@@ -153,6 +167,18 @@ async def ask(
             stream_db.close()
 
     return EventSourceResponse(event_generator())
+
+@router.post("/actions/{action_id}/confirm")
+def confirm_assistant_action(action_id: str, payload: ActionConfirmRequest, db: Session = Depends(get_db), principal: Principal = Depends(get_current_principal)):
+    result = confirm_action(db, principal, action_id, payload)
+    db.commit()
+    return result
+
+@router.post("/actions/{action_id}/cancel")
+def cancel_assistant_action(action_id: str, db: Session = Depends(get_db), principal: Principal = Depends(get_current_principal)):
+    result = cancel_action(db, principal, action_id)
+    db.commit()
+    return result
 
 
 @router.get("/threads", response_model=list[ThreadOut])

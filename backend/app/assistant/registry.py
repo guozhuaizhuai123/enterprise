@@ -68,6 +68,9 @@ class DocumentTargetUpdate(DocumentUpdate):
 
     id: str = Field(min_length=1, max_length=64)
 
+class AssistantDocumentCreate(DocumentCreate):
+    department_id: str = Field(min_length=1, max_length=64)
+
 
 class OrgUnitTargetUpdate(OrgUnitUpdate):
     """Assistant updates always bind the organization unit selected during preview."""
@@ -144,7 +147,7 @@ _ACTIONS: tuple[ActionDefinition, ...] = (
     _metadata("update_project", ProjectTargetUpdate, ("admin", "hr", "manager"), "high", target_model=Project),
     _metadata("create_contract", ContractCreate, ("admin", "hr", "manager"), "high"),
     _metadata("update_contract", ContractTargetUpdate, ("admin", "hr", "manager"), "high", target_model=Contract),
-    _metadata("create_document", DocumentCreate, ("admin",), "high", execute=kb_service.create_document),
+    _metadata("create_document", AssistantDocumentCreate, ("admin",), "high", execute=kb_service.create_document),
     _metadata("update_document", DocumentTargetUpdate, ("admin",), "high", execute=kb_service.update_document, target_model=Document),
     _metadata("create_expense_draft", ExpenseClaimCreate, ("admin", "employee", "hr", "manager", "finance"), "high", execute=ExpenseService.create_draft),
     _metadata("update_expense_draft", ExpenseDraftTargetUpdate, ("admin", "employee", "hr", "manager", "finance"), "high", execute=ExpenseService.update_draft, target_model=ExpenseClaim),

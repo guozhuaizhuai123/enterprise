@@ -61,8 +61,8 @@ def _adapter(name: str):
     return assistant_service._ACTION_ADAPTERS[name]
 
 
-def test_installation_registers_only_the_seven_production_read_actions(monkeypatch):
-    """Adding a write adapter or omitting a read adapter would widen or break the approved catalog."""
+def test_installation_registers_the_approved_read_and_write_actions(monkeypatch):
+    """Omitting an approved adapter would make a confirmed catalog action unsupported."""
     from app.assistant.adapters import install_production_adapters
 
     monkeypatch.setattr(assistant_service, "_ACTION_ADAPTERS", {})
@@ -78,6 +78,17 @@ def test_installation_registers_only_the_seven_production_read_actions(monkeypat
         "list_expenses",
         "list_approvals",
         "list_tickets",
+        "create_org_unit",
+        "update_org_unit",
+        "create_project",
+        "update_project",
+        "delete_project",
+        "create_contract",
+        "update_contract",
+        "delete_contract",
+        "create_document",
+        "update_document",
+        "delete_document",
     }
 
 

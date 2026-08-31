@@ -16,6 +16,8 @@ from app.assistant.service import register_action_adapter
 from app.deps import Principal
 from app.expense.service import ExpenseService
 from app.kb import retriever
+from app.kb.service import _index_document
+from app.organization.service import OrganizationService
 from app.kb.retriever import RetrievedChunk
 from app.models import (
     ApprovalInstance,
@@ -437,3 +439,54 @@ def install_production_adapters() -> None:
     register_action_adapter("list_expenses", _list_expenses)
     register_action_adapter("list_approvals", _list_approvals)
     register_action_adapter("list_tickets", _list_tickets)
+    for _name,_fn in {"create_org_unit":_create_org,"update_org_unit":_update_org,"create_project":_create_project,"update_project":_update_project,"delete_project":_delete_project,"create_contract":_create_contract,"update_contract":_update_contract,"delete_contract":_delete_contract,"create_document":_create_document,"update_document":_update_document,"delete_document":_delete_document}.items():
+        register_action_adapter(_name,_fn)
+
+def _create_org(s,p,x):
+    row=OrganizationService.create_org_unit(s, _schema("OrgUnitCreate",x)); return {"id":row.id,"name":row.name,"code":row.code}
+def _update_org(s,p,x):
+    row=s.get(Department,x["id"])
+    if row is None: raise HTTPException(404,"organization unit not found")
+    OrganizationService.update_org_unit(s,row,_schema("OrgUnitUpdate",{k:v for k,v in x.items() if k!="id"})); return {"id":row.id,"name":row.name,"code":row.code}
+def _create_project(s,p,x):
+    row=Project(created_by=p.user_id,**x); s.add(row); s.flush(); return {"id":row.id,"code":row.code,"name":row.name,"status":row.status}
+def _update_project(s,p,x):
+    row=s.get(Project,x["id"])
+    if row is None: raise HTTPException(404,"project not found")
+    for k,v in x.items():
+        if k!="id" and v is not None: setattr(row,k,v)
+    s.flush(); return {"id":row.id,"code":row.code,"name":row.name,"status":row.status}
+def _delete_project(s,p,x):
+    row=s.get(Project,x["id"])
+    if row is None: raise HTTPException(404,"project not found")
+    s.query(Contract).filter(Contract.project_id==row.id).update({Contract.project_id:None},synchronize_session=False); s.query(Document).filter(Document.project_id==row.id).update({Document.project_id:None},synchronize_session=False); s.delete(row); s.flush(); return {"id":x["id"],"deleted":True}
+def _create_contract(s,p,x):
+    row=Contract(created_by=p.user_id,**x); s.add(row); s.flush(); return {"id":row.id,"code":row.code,"name":row.name,"status":row.status}
+def _update_contract(s,p,x):
+    row=s.get(Contract,x["id"])
+    if row is None: raise HTTPException(404,"contract not found")
+    for k,v in x.items():
+        if k!="id" and v is not None: setattr(row,k,v)
+    s.flush(); return {"id":row.id,"code":row.code,"name":row.name,"status":row.status}
+def _delete_contract(s,p,x):
+    row=s.get(Contract,x["id"])
+    if row is None: raise HTTPException(404,"contract not found")
+    s.query(Document).filter(Document.contract_id==row.id).update({Document.contract_id:None},synchronize_session=False); s.delete(row); s.flush(); return {"id":x["id"],"deleted":True}
+def _create_document(s,p,x):
+    if s.get(Department,x["department_id"]) is None: raise HTTPException(404,"department not found")
+    data={k:v for k,v in x.items() if k!="department_id"}; row=Document(department_id=x["department_id"],uploaded_by=p.user_id,owner_id=p.user_id,owner_name=p.username,**data); s.add(row); s.flush(); _index_document(s,row); return {"id":row.id,"title":row.title,"department_id":row.department_id}
+def _update_document(s,p,x):
+    row=s.get(Document,x["id"])
+    if row is None: raise HTTPException(404,"document not found")
+    changed=False
+    for k,v in x.items():
+        if k!="id" and v is not None and hasattr(row,k): setattr(row,k,v); changed=changed or k=="content"
+    if changed: _index_document(s,row)
+    s.flush(); return {"id":row.id,"title":row.title,"department_id":row.department_id}
+def _delete_document(s,p,x):
+    row=s.get(Document,x["id"])
+    if row is None: raise HTTPException(404,"document not found")
+    s.delete(row); s.flush(); return {"id":x["id"],"deleted":True}
+def _schema(name,x):
+    from app import schemas
+    return getattr(schemas,name).model_validate(x)
