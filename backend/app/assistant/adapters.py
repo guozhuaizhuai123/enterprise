@@ -17,7 +17,12 @@ from app.deps import Principal
 from app.expense.service import ExpenseService
 from app.kb import retriever
 from app.kb.service import _index_document
+from app.kb import service as kb_service
 from app.organization.service import OrganizationService
+from app.expense.service import ExpenseService
+from app.schedule.service import create_leave_request
+from app.workflow.service import WorkflowService
+from app.payroll.service import PayrollService
 from app.kb.retriever import RetrievedChunk
 from app.models import (
     ApprovalInstance,
@@ -30,6 +35,17 @@ from app.models import (
     Ticket,
     User,
     UserRole,
+)
+from app.project_contract import service as project_contract_service
+from app.schemas import (
+    ContractCreate,
+    ContractUpdate,
+    DocumentCreate,
+    DocumentUpdate,
+    OrgUnitCreate,
+    OrgUnitUpdate,
+    ProjectCreate,
+    ProjectUpdate,
 )
 
 
@@ -439,42 +455,54 @@ def install_production_adapters() -> None:
     register_action_adapter("list_expenses", _list_expenses)
     register_action_adapter("list_approvals", _list_approvals)
     register_action_adapter("list_tickets", _list_tickets)
-    for _name,_fn in {"create_org_unit":_create_org,"update_org_unit":_update_org,"create_project":_create_project,"update_project":_update_project,"delete_project":_delete_project,"create_contract":_create_contract,"update_contract":_update_contract,"delete_contract":_delete_contract,"create_document":_create_document,"update_document":_update_document,"delete_document":_delete_document}.items():
+    register_action_adapter("create_org_unit", _create_org)
+    register_action_adapter("update_org_unit", _update_org)
+    register_action_adapter("create_project", _create_project)
+    register_action_adapter("update_project", _update_project)
+    register_action_adapter("delete_project", _delete_project)
+    register_action_adapter("create_contract", _create_contract)
+    register_action_adapter("update_contract", _update_contract)
+    register_action_adapter("delete_contract", _delete_contract)
+    register_action_adapter("create_document", _create_document)
+    register_action_adapter("update_document", _update_document)
+    register_action_adapter("delete_document", _delete_document)
+    for _name,_fn in {"create_expense_draft":_create_expense,"update_expense_draft":_update_expense,"delete_expense_draft":_delete_expense,"create_leave_request":_leave,"create_ticket":_ticket,"delete_ticket":_delete_ticket,"approve_approval":lambda s,p,x:_approval(s,p,x,"approve"),"reject_approval":lambda s,p,x:_approval(s,p,x,"reject"),"cancel_approval":lambda s,p,x:_approval(s,p,x,"cancel"),"pay_expense":_pay,"generate_payroll":_payroll}.items():
         register_action_adapter(_name,_fn)
 
 def _create_org(s,p,x):
-    row=OrganizationService.create_org_unit(s, _schema("OrgUnitCreate",x)); return {"id":row.id,"name":row.name,"code":row.code}
+    row = OrganizationService.create_org_unit(s, OrgUnitCreate.model_validate(x))
+    return {"id": row.id, "name": row.name, "code": row.code, "parent_id": row.parent_id, "manager_id": row.manager_id, "active": row.active}
 def _update_org(s,p,x):
     row=s.get(Department,x["id"])
     if row is None: raise HTTPException(404,"organization unit not found")
-    OrganizationService.update_org_unit(s,row,_schema("OrgUnitUpdate",{k:v for k,v in x.items() if k!="id"})); return {"id":row.id,"name":row.name,"code":row.code}
+    OrganizationService.update_org_unit(s, row, OrgUnitUpdate.model_validate({k: v for k, v in x.items() if k != "id"}))
+    return {"id": row.id, "name": row.name, "code": row.code, "parent_id": row.parent_id, "manager_id": row.manager_id, "active": row.active}
 def _create_project(s,p,x):
-    if s.query(Project).filter(Project.code == x["code"].strip()).first(): raise HTTPException(409,"project code already exists")
-    row=Project(created_by=p.user_id,**x); s.add(row); s.flush(); return {"id":row.id,"code":row.code,"name":row.name,"status":row.status}
+    row = project_contract_service.create_project(s, ProjectCreate.model_validate(x), created_by=p.user_id)
+    return {"id": row.id, "code": row.code, "name": row.name, "status": row.status, "department_id": row.department_id, "manager_id": row.manager_id}
 def _update_project(s,p,x):
     row=s.get(Project,x["id"])
     if row is None: raise HTTPException(404,"project not found")
-    for k,v in x.items():
-        if k!="id" and v is not None: setattr(row,k,v)
-    s.flush(); return {"id":row.id,"code":row.code,"name":row.name,"status":row.status}
+    row = project_contract_service.update_project(s, row, ProjectUpdate.model_validate({k: v for k, v in x.items() if k != "id"}))
+    return {"id": row.id, "code": row.code, "name": row.name, "status": row.status, "department_id": row.department_id, "manager_id": row.manager_id}
 def _delete_project(s,p,x):
     row=s.get(Project,x["id"])
     if row is None: raise HTTPException(404,"project not found")
-    s.query(Contract).filter(Contract.project_id==row.id).update({Contract.project_id:None},synchronize_session=False); s.query(Document).filter(Document.project_id==row.id).update({Document.project_id:None},synchronize_session=False); s.delete(row); s.flush(); return {"id":x["id"],"deleted":True}
+    project_contract_service.delete_project(s, row)
+    return {"id":x["id"],"deleted":True}
 def _create_contract(s,p,x):
-    if s.query(Contract).filter(Contract.code == x["code"].strip()).first(): raise HTTPException(409,"contract code already exists")
-    if x.get("project_id") and s.get(Project,x["project_id"]) is None: raise HTTPException(400,"project not found")
-    row=Contract(created_by=p.user_id,**x); s.add(row); s.flush(); return {"id":row.id,"code":row.code,"name":row.name,"status":row.status}
+    row = project_contract_service.create_contract(s, ContractCreate.model_validate(x), created_by=p.user_id)
+    return {"id": row.id, "code": row.code, "name": row.name, "status": row.status, "project_id": row.project_id, "owner_id": row.owner_id}
 def _update_contract(s,p,x):
     row=s.get(Contract,x["id"])
     if row is None: raise HTTPException(404,"contract not found")
-    for k,v in x.items():
-        if k!="id" and v is not None: setattr(row,k,v)
-    s.flush(); return {"id":row.id,"code":row.code,"name":row.name,"status":row.status}
+    row = project_contract_service.update_contract(s, row, ContractUpdate.model_validate({k: v for k, v in x.items() if k != "id"}))
+    return {"id": row.id, "code": row.code, "name": row.name, "status": row.status, "project_id": row.project_id, "owner_id": row.owner_id}
 def _delete_contract(s,p,x):
     row=s.get(Contract,x["id"])
     if row is None: raise HTTPException(404,"contract not found")
-    s.query(Document).filter(Document.contract_id==row.id).update({Document.contract_id:None},synchronize_session=False); s.delete(row); s.flush(); return {"id":x["id"],"deleted":True}
+    project_contract_service.delete_contract(s, row)
+    return {"id":x["id"],"deleted":True}
 def _create_document(s,p,x):
     if s.get(Department,x["department_id"]) is None: raise HTTPException(404,"department not found")
     if x.get("project_id") and s.get(Project,x["project_id"]) is None: raise HTTPException(400,"project not found")
@@ -495,6 +523,26 @@ def _delete_document(s,p,x):
     row=s.get(Document,x["id"])
     if row is None: raise HTTPException(404,"document not found")
     s.delete(row); s.flush(); return {"id":x["id"],"deleted":True}
+
+def _create_expense(s,p,x):
+    row=ExpenseService.create_draft(s,requester_id=p.user_id,title=x["title"],purpose=x.get("purpose", ""),project_code=x.get("project_code", ""),currency=x.get("currency","CNY"),expected_total=x.get("total_amount"),items=x["items"]); return {"id":row.id,"claim_no":row.claim_no,"status":row.status}
+def _update_expense(s,p,x):
+    row=ExpenseService.update_draft(s,x["id"],p.user_id,title=x.get("title"),purpose=x.get("purpose"),project_code=x.get("project_code"),items=x.get("items"),expected_total=x.get("total_amount")); return {"id":row.id,"status":row.status,"version":row.version}
+def _delete_expense(s,p,x): ExpenseService.delete_draft(s,x["id"],p.user_id); return {"id":x["id"],"deleted":True}
+def _leave(s,p,x):
+    row=create_leave_request(s,user_id=p.user_id,leave_type=x["leave_type"],start_date=x["start_date"],end_date=x["end_date"],reason=x.get("reason", "")); return {"id":row.id,"status":row.status}
+def _ticket(s,p,x):
+    row=Ticket(requester_id=p.user_id,department_id=x.get("department_id") or p.department_id,ticket_type=x["ticket_type"],subject=x["subject"],description=x["description"],target_user_id=x.get("target_user_id"),requested_department_id=x.get("requested_department_id"),status="pending_admin",requires_admin=True); s.add(row); s.flush(); return {"id":row.id,"status":row.status,"subject":row.subject}
+def _delete_ticket(s,p,x):
+    row=s.get(Ticket,x["id"])
+    if row is None: raise HTTPException(404,"ticket not found")
+    s.delete(row); s.flush(); return {"id":x["id"],"deleted":True}
+def _approval(s,p,x,action):
+    row=WorkflowService.act(s,x["id"],p.user_id,action,x.get("comment", ""),x["expected_version"]); return {"id":row.id,"status":row.status,"version":row.version}
+def _pay(s,p,x):
+    row=ExpenseService.pay(s,x["id"],p.user_id,x,x["idempotency_key"],x["expected_version"]); return {"id":row.id,"claim_id":row.claim_id,"amount":str(row.amount)}
+def _payroll(s,p,x):
+    row=PayrollService.generate_run(s,p.user_id,period=x.get("period")); return {"id":row.id if row else None,"period":row.period if row else None,"status":row.status if row else "not_due"}
 def _schema(name,x):
     from app import schemas
     return getattr(schemas,name).model_validate(x)

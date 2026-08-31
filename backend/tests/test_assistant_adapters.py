@@ -89,6 +89,7 @@ def test_installation_registers_the_approved_read_and_write_actions(monkeypatch)
         "create_document",
         "update_document",
         "delete_document",
+        "create_expense_draft", "update_expense_draft", "delete_expense_draft", "create_leave_request", "create_ticket", "delete_ticket", "approve_approval", "reject_approval", "cancel_approval", "pay_expense", "generate_payroll",
     }
 
 
