@@ -722,6 +722,7 @@ class AssistantAction(Base):
     parameter_hash: Mapped[str] = mapped_column(String(128), nullable=False, default="")
     object_versions_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     confirmation_phrase: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    confirmation_step: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

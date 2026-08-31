@@ -470,6 +470,7 @@ def test_execute_action_rechecks_high_risk_confirmation_phrase(db, monkeypatch):
     preview = create_preview(db, _principal(), "thread-1", _plan("create_project", {"code": "KB-1", "name": "知识库"}))
     action = db.get(AssistantAction, preview.action_id)
     action.status = "confirmed"
+    action.confirmation_step = 1
 
     rejected = assistant_service.execute_action(db, _principal(), preview.action_id)
     completed = assistant_service.execute_action(
@@ -491,3 +492,143 @@ def test_is_confirmation_valid_rejects_non_preview_status(db):
 
     assert valid is False
     assert error_code == "confirmation_not_available"
+
+
+def test_stale_second_confirmation_from_an_independent_session_never_runs_adapter_twice(db, monkeypatch):
+    """Removing the conditional preview claim lets a stale second session execute the same action twice."""
+    calls = []
+    monkeypatch.setattr(assistant_service, "_ACTION_ADAPTERS", {}, raising=False)
+    assistant_service.register_action_adapter(
+        "create_project", lambda adapter_db, principal, payload: calls.append(payload) or {"created": payload["code"]}
+    )
+    preview = create_preview(db, _principal(), "thread-1", _plan("create_project", {"code": "KB-1", "name": "知识库"}))
+    db.commit()
+    sessions = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+    first = sessions()
+    second = sessions()
+    try:
+        stale_preview = second.get(AssistantAction, preview.action_id)
+        assert stale_preview is not None and stale_preview.status == "preview"
+        first_result = assistant_service.confirm_action(first, _principal(), preview.action_id, _confirmation(preview))
+        first.commit()
+        second_result = assistant_service.confirm_action(second, _principal(), preview.action_id, _confirmation(preview))
+
+        assert first_result.status == "completed"
+        assert second_result.status == "completed"
+        assert len(calls) == 1
+    finally:
+        first.close()
+        second.close()
+
+
+def test_stale_execute_loses_to_committed_cancel_without_calling_adapter(db, monkeypatch):
+    """A cancellation that wins the conditional state transition must prevent a stale execution from starting."""
+    calls = []
+    monkeypatch.setattr(assistant_service, "_ACTION_ADAPTERS", {}, raising=False)
+    assistant_service.register_action_adapter(
+        "create_project", lambda adapter_db, principal, payload: calls.append(payload) or {"created": payload["code"]}
+    )
+    preview = create_preview(db, _principal(), "thread-1", _plan("create_project", {"code": "KB-1", "name": "知识库"}))
+    action = db.get(AssistantAction, preview.action_id)
+    action.status = "confirmed"
+    action.confirmation_step = 1
+    db.commit()
+    sessions = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+    stale_executor = sessions()
+    canceller = sessions()
+    try:
+        stale_action = stale_executor.get(AssistantAction, preview.action_id)
+        assert stale_action is not None and stale_action.status == "confirmed"
+        cancelled = assistant_service.cancel_action(canceller, _principal(), preview.action_id)
+        canceller.commit()
+        execute_result = assistant_service.execute_action(
+            stale_executor, _principal(), preview.action_id, confirmation_phrase=preview.confirmation_phrase
+        )
+
+        assert cancelled.status == "cancelled"
+        assert execute_result.status == "cancelled"
+        assert calls == []
+    finally:
+        stale_executor.close()
+        canceller.close()
+
+
+def test_stale_second_execute_from_an_independent_session_never_runs_adapter_twice(db, monkeypatch):
+    """Removing the conditional executing claim lets a stale confirmed action run its adapter twice."""
+    calls = []
+    monkeypatch.setattr(assistant_service, "_ACTION_ADAPTERS", {}, raising=False)
+    assistant_service.register_action_adapter(
+        "create_project", lambda adapter_db, principal, payload: calls.append(payload) or {"created": payload["code"]}
+    )
+    preview = create_preview(db, _principal(), "thread-1", _plan("create_project", {"code": "KB-1", "name": "知识库"}))
+    action = db.get(AssistantAction, preview.action_id)
+    action.status = "confirmed"
+    action.confirmation_step = 1
+    db.commit()
+    sessions = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+    first = sessions()
+    second = sessions()
+    try:
+        stale_action = second.get(AssistantAction, preview.action_id)
+        assert stale_action is not None and stale_action.status == "confirmed"
+        first_result = assistant_service.execute_action(
+            first, _principal(), preview.action_id, confirmation_phrase=preview.confirmation_phrase
+        )
+        first.commit()
+        second_result = assistant_service.execute_action(
+            second, _principal(), preview.action_id, confirmation_phrase=preview.confirmation_phrase
+        )
+
+        assert first_result.status == "completed"
+        assert second_result.status == "completed"
+        assert len(calls) == 1
+    finally:
+        first.close()
+        second.close()
+
+
+def test_project_update_target_snapshot_rejects_current_target_change(db, monkeypatch):
+    """Dropping target IDs or snapshots lets an update confirmation apply to a changed project."""
+    project = Project(id="project-1", code="KB-1", name="原项目")
+    db.add(project)
+    db.flush()
+    preview = create_preview(
+        db,
+        _principal(),
+        "thread-1",
+        _plan("update_project", {"id": project.id, "name": "新项目"}),
+    )
+    action = db.get(AssistantAction, preview.action_id)
+    project.name = "并发更新"
+    db.flush()
+    calls = []
+    monkeypatch.setattr(assistant_service, "_ACTION_ADAPTERS", {}, raising=False)
+    assistant_service.register_action_adapter(
+        "update_project", lambda adapter_db, principal, payload: calls.append(payload) or {"updated": payload["id"]}
+    )
+
+    result = assistant_service.confirm_action(db, _principal(), preview.action_id, _confirmation(preview))
+
+    assert action.object_versions_json[project.id].startswith("snapshot:")
+    assert result.error_code == "object_version_changed"
+    assert calls == []
+
+
+def test_adapter_write_then_exception_rolls_back_savepoint_and_records_failure(db, monkeypatch):
+    """Without a savepoint, a failing adapter can leave its business write in the caller transaction."""
+    def mutating_failure(adapter_db, principal, payload):
+        adapter_db.add(Project(code="ROLLBACK-1", name="不应保留"))
+        adapter_db.flush()
+        raise RuntimeError("adapter failed")
+
+    monkeypatch.setattr(assistant_service, "_ACTION_ADAPTERS", {}, raising=False)
+    assistant_service.register_action_adapter("create_project", mutating_failure)
+    preview = create_preview(db, _principal(), "thread-1", _plan("create_project", {"code": "KB-1", "name": "知识库"}))
+
+    result = assistant_service.confirm_action(db, _principal(), preview.action_id, _confirmation(preview))
+    db.expire_all()
+
+    assert result.status == "failed"
+    assert result.error_code == "execution_failed"
+    assert db.query(Project).filter(Project.code == "ROLLBACK-1").count() == 0
+    assert db.query(AuditLog).filter(AuditLog.action == "assistant_action_failed").count() == 1
