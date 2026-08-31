@@ -68,6 +68,18 @@ class DocumentTargetUpdate(DocumentUpdate):
     id: str = Field(min_length=1, max_length=64)
 
 
+class OrgUnitTargetUpdate(OrgUnitUpdate):
+    """Assistant updates always bind the organization unit selected during preview."""
+
+    id: str = Field(min_length=1, max_length=64)
+
+
+class ExpenseDraftTargetUpdate(ExpenseClaimUpdate):
+    """Assistant updates always bind the expense draft selected during preview."""
+
+    id: str = Field(min_length=1, max_length=64)
+
+
 class ApprovalActionInput(ApprovalDecisionIn):
     id: str = Field(min_length=1, max_length=64)
 
@@ -123,7 +135,7 @@ _ACTIONS: tuple[ActionDefinition, ...] = (
     _metadata("list_approvals", QueryInput, ("admin", "hr", "finance", "manager"), "sensitive", sensitive_read=True),
     _metadata("list_tickets", QueryInput, ("admin", "hr", "manager"), "low"),
     _metadata("create_org_unit", OrgUnitCreate, ("admin", "hr"), "high", execute=OrganizationService.create_org_unit),
-    _metadata("update_org_unit", OrgUnitUpdate, ("admin", "hr"), "high", execute=OrganizationService.update_org_unit),
+    _metadata("update_org_unit", OrgUnitTargetUpdate, ("admin", "hr"), "high", execute=OrganizationService.update_org_unit),
     _metadata("create_project", ProjectCreate, ("admin", "hr", "manager"), "high"),
     _metadata("update_project", ProjectTargetUpdate, ("admin", "hr", "manager"), "high"),
     _metadata("create_contract", ContractCreate, ("admin", "hr", "manager"), "high"),
@@ -131,7 +143,7 @@ _ACTIONS: tuple[ActionDefinition, ...] = (
     _metadata("create_document", DocumentCreate, ("admin",), "high", execute=kb_service.create_document),
     _metadata("update_document", DocumentTargetUpdate, ("admin",), "high", execute=kb_service.update_document),
     _metadata("create_expense_draft", ExpenseClaimCreate, ("admin", "employee", "hr", "manager", "finance"), "high", execute=ExpenseService.create_draft),
-    _metadata("update_expense_draft", ExpenseClaimUpdate, ("admin", "employee", "hr", "manager", "finance"), "high", execute=ExpenseService.update_draft),
+    _metadata("update_expense_draft", ExpenseDraftTargetUpdate, ("admin", "employee", "hr", "manager", "finance"), "high", execute=ExpenseService.update_draft),
     _metadata("create_leave_request", LeaveRequestCreate, ("admin", "employee", "hr", "manager", "finance"), "high", execute=create_leave_request),
     _metadata("create_ticket", TicketCreate, ("admin", "employee", "hr", "manager", "finance"), "high"),
     _metadata("approve_approval", ApprovalActionInput, ("admin", "hr", "manager", "finance"), "high", execute=WorkflowService.act),

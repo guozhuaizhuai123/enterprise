@@ -14,7 +14,7 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException, status
 from pydantic import BaseModel, ValidationError
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.assistant.planner import ActionPlan
@@ -22,7 +22,7 @@ from app.assistant.registry import ActionDefinition, get_action
 from app.assistant.schemas import ActionConfirmRequest, ActionPreview, ActionResult
 from app.audit.service import AuditService
 from app.deps import Principal
-from app.models import ApprovalInstance, AssistantAction, Contract, Document, ExpenseClaim, Project, Ticket
+from app.models import ApprovalInstance, AssistantAction, Contract, Department, Document, ExpenseClaim, Project, Ticket
 
 
 _PREVIEW_TTL = timedelta(minutes=5)
@@ -36,6 +36,7 @@ _VERSIONED_ACTION_MODELS = {
     "approve_approval": ApprovalInstance,
     "reject_approval": ApprovalInstance,
     "cancel_approval": ApprovalInstance,
+    "update_org_unit": Department,
     "update_expense_draft": ExpenseClaim,
     "delete_expense_draft": ExpenseClaim,
     "pay_expense": ExpenseClaim,
@@ -82,13 +83,23 @@ def _row_snapshot(row: Any) -> str:
     return "snapshot:" + sha256(encoded).hexdigest()
 
 
-def _object_versions(db: Session, definition: ActionDefinition, payload: dict[str, Any]) -> dict[str, int | str]:
+def _object_versions(
+    db: Session, definition: ActionDefinition, payload: dict[str, Any], *, lock_target: bool = False
+) -> dict[str, int | str]:
     """Resolve a target revision or deterministic snapshot for a mutable action."""
     model = _VERSIONED_ACTION_MODELS.get(definition.name)
     object_id = payload.get("id")
     if model is None or not isinstance(object_id, str):
         return {}
-    row = db.get(model, object_id)
+    if lock_target:
+        row = db.execute(
+            select(model)
+            .where(model.id == object_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).scalar_one_or_none()
+    else:
+        row = db.get(model, object_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "assistant action target was not found")
     version = getattr(row, "version", None) if row is not None else None
@@ -330,7 +341,7 @@ def _expire_action(db: Session, principal: Principal, action: AssistantAction) -
 
 
 def _current_action_state(
-    db: Session, principal: Principal, action: AssistantAction
+    db: Session, principal: Principal, action: AssistantAction, *, lock_target: bool = False
 ) -> tuple[ActionDefinition | None, dict[str, Any] | None, str | None]:
     """Revalidate mutable action constraints before confirmation or execution."""
     definition = get_action(action.tool_name)
@@ -345,7 +356,7 @@ def _current_action_state(
         return definition, None, "invalid_action_payload"
 
     try:
-        current_versions = _object_versions(db, definition, payload)
+        current_versions = _object_versions(db, definition, payload, lock_target=lock_target)
     except HTTPException:
         return definition, None, "object_version_changed"
     if current_versions != (action.object_versions_json or {}):
@@ -516,6 +527,22 @@ def execute_action(
         new_status="executing",
         executed_at=_now_utc(),
     ):
+        return _result(action)
+
+    _post_definition, _post_payload, post_claim_error = _current_action_state(
+        db, principal, action, lock_target=True
+    )
+    if post_claim_error is not None:
+        action.status = "failed"
+        action.error_code = post_claim_error
+        AuditService.record(
+            db,
+            principal,
+            "assistant_action_failed",
+            "assistant_action",
+            action.id,
+            after={"error_code": action.error_code},
+        )
         return _result(action)
 
     adapter = _ACTION_ADAPTERS.get(action.tool_name)

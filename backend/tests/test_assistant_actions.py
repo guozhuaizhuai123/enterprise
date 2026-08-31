@@ -16,7 +16,7 @@ from app.assistant.registry import ActionDefinition, get_action
 from app.assistant.schemas import ActionChange, ActionConfirmRequest, ActionPreview, ActionResult
 from app.assistant.service import create_preview
 from app.deps import Principal
-from app.models import AssistantAction, AuditLog, ExpenseClaim, Project
+from app.models import AssistantAction, AuditLog, Department, ExpenseClaim, Project
 
 
 @pytest.fixture
@@ -632,3 +632,119 @@ def test_adapter_write_then_exception_rolls_back_savepoint_and_records_failure(d
     assert result.error_code == "execution_failed"
     assert db.query(Project).filter(Project.code == "ROLLBACK-1").count() == 0
     assert db.query(AuditLog).filter(AuditLog.action == "assistant_action_failed").count() == 1
+
+
+def test_org_and_expense_updates_bind_target_ids_and_reject_changed_or_deleted_targets(db, monkeypatch):
+    """Omitting either target ID allows a mutable assistant update to run against a different current object."""
+    department = Department(id="dept-1", name="研发", code="RND")
+    expense = ExpenseClaim(id="expense-1", claim_no="EXP-001", requester_id="admin", title="差旅行程")
+    db.add_all([department, expense])
+    db.flush()
+    org_preview = create_preview(
+        db, _principal(), "thread-1", _plan("update_org_unit", {"id": department.id, "name": "工程"})
+    )
+    expense_preview = create_preview(
+        db, _principal(), "thread-1", _plan("update_expense_draft", {"id": expense.id, "title": "新行程"})
+    )
+    org_action = db.get(AssistantAction, org_preview.action_id)
+    expense_action = db.get(AssistantAction, expense_preview.action_id)
+    department.name = "并发改名"
+    db.delete(expense)
+    db.flush()
+    calls = []
+    monkeypatch.setattr(assistant_service, "_ACTION_ADAPTERS", {}, raising=False)
+    assistant_service.register_action_adapter(
+        "update_org_unit", lambda adapter_db, principal, payload: calls.append(payload) or {"updated": payload["id"]}
+    )
+    assistant_service.register_action_adapter(
+        "update_expense_draft", lambda adapter_db, principal, payload: calls.append(payload) or {"updated": payload["id"]}
+    )
+
+    org_result = assistant_service.confirm_action(db, _principal(), org_preview.action_id, _confirmation(org_preview))
+    expense_result = assistant_service.confirm_action(
+        db, _principal(), expense_preview.action_id, _confirmation(expense_preview)
+    )
+
+    assert org_action.payload_json["id"] == department.id
+    assert expense_action.payload_json["id"] == expense.id
+    assert org_action.object_versions_json[department.id].startswith("snapshot:")
+    assert expense_action.object_versions_json[expense.id] == 1
+    assert [org_result.error_code, expense_result.error_code] == ["object_version_changed", "object_version_changed"]
+    assert calls == []
+
+
+def test_post_claim_target_recheck_blocks_interleaved_change_before_adapter(tmp_path, monkeypatch):
+    """A target changed after precheck but before the execution claim must fail before its adapter runs."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'assistant-actions.db'}")
+    Base.metadata.create_all(engine)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    setup = sessions()
+    executor = sessions()
+    modifier = sessions()
+    try:
+        department = Department(id="dept-1", name="研发", code="RND")
+        setup.add(department)
+        setup.flush()
+        preview = create_preview(
+            setup, _principal(), "thread-1", _plan("update_org_unit", {"id": department.id, "name": "工程"})
+        )
+        action = setup.get(AssistantAction, preview.action_id)
+        action.status = "confirmed"
+        action.confirmation_step = 1
+        setup.commit()
+        calls = []
+        monkeypatch.setattr(assistant_service, "_ACTION_ADAPTERS", {}, raising=False)
+        assistant_service.register_action_adapter(
+            "update_org_unit", lambda adapter_db, principal, payload: calls.append(payload) or {"updated": payload["id"]}
+        )
+        original_transition = assistant_service._conditional_transition
+
+        def change_target_between_precheck_and_claim(db, action, **kwargs):
+            if kwargs["new_status"] == "executing":
+                target = modifier.get(Department, department.id)
+                assert target is not None
+                target.name = "插入式更新"
+                modifier.commit()
+            return original_transition(db, action, **kwargs)
+
+        monkeypatch.setattr(assistant_service, "_conditional_transition", change_target_between_precheck_and_claim)
+        result = assistant_service.execute_action(
+            executor, _principal(), preview.action_id, confirmation_phrase=preview.confirmation_phrase
+        )
+
+        assert result.status == "failed"
+        assert result.error_code == "object_version_changed"
+        assert calls == []
+        assert executor.query(AuditLog).filter(AuditLog.action == "assistant_action_failed").count() == 1
+    finally:
+        executor.close()
+        modifier.close()
+        setup.close()
+        Base.metadata.drop_all(engine)
+        engine.dispose()
+
+
+def test_every_existing_target_mutation_is_id_bound_and_version_or_snapshot_checked():
+    """Adding a mutable catalog action without this mapping would silently recreate the stale-target bypass."""
+    target_mutations = {
+        "approve_approval",
+        "reject_approval",
+        "cancel_approval",
+        "update_org_unit",
+        "update_project",
+        "update_contract",
+        "update_document",
+        "update_expense_draft",
+        "delete_project",
+        "delete_contract",
+        "delete_document",
+        "delete_expense_draft",
+        "delete_ticket",
+        "pay_expense",
+    }
+
+    assert target_mutations == set(assistant_service._VERSIONED_ACTION_MODELS)
+    for action_name in target_mutations:
+        definition = get_action(action_name)
+        assert definition is not None
+        assert definition.input_model.model_fields["id"].is_required()
