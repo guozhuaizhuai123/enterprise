@@ -100,3 +100,38 @@ $ /Users/guozhuaizhuai/Desktop/enterprise-kb-system/backend/.venv/bin/python -m 
 $ /Users/guozhuaizhuai/Desktop/enterprise-kb-system/backend/.venv/bin/python -m pytest -q
 215 passed, 11 warnings, 3 subtests passed in 5.60s
 ```
+
+## Second follow-up review fix
+
+- Added `ExpenseService.visibility_predicate()`, the shared SQL policy source
+  used both by `ExpenseService.can_view()` for an individual claim and by the
+  adapter for its bounded expense list. Finance/HR scope, manager reports,
+  ownership, absent actors, and root administrators retain the same policy.
+- Removed the approval-list window ranking and nested task projection. The
+  bounded approval page retains its top-level fields (including requester
+  department and requester name), while approval visibility remains enforced
+  through the existing workflow-scope SQL conditions.
+
+### Second follow-up RED
+
+```text
+3 failed, 9 passed
+- finance list: 51 SELECT ... FROM user_roles statements
+- manager list: 51 SELECT ... FROM employee_profiles statements
+- approval rows still contained nested tasks from ranked task history
+```
+
+### Second follow-up GREEN
+
+```text
+$ /Users/guozhuaizhuai/Desktop/enterprise-kb-system/backend/.venv/bin/python -m pytest tests/test_assistant_adapters.py -q
+............                                                             [100%]
+12 passed, 11 warnings in 2.90s
+```
+
+### Second follow-up full suite
+
+```text
+$ /Users/guozhuaizhuai/Desktop/enterprise-kb-system/backend/.venv/bin/python -m pytest -q
+218 passed, 11 warnings, 3 subtests passed in 6.04s
+```

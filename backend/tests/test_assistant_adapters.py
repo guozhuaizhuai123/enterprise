@@ -20,6 +20,7 @@ from app.models import (
     Ticket,
     User,
     UserDepartment,
+    UserRole,
     WorkflowDefinition,
     WorkflowNode,
 )
@@ -340,3 +341,106 @@ def test_project_and_approval_pages_prefetch_related_rows_in_constant_query_batc
     assert len(approvals["items"]) == 50
     assert sum("FROM USERS" in statement for statement in statements) <= 2
     assert sum("FROM APPROVAL_TASKS" in statement for statement in statements) <= 2
+
+
+@pytest.mark.parametrize("actor_role", ["finance", "manager"])
+def test_expense_visibility_is_evaluated_once_for_a_finance_or_manager_page(db, actor_role):
+    """Rechecking each claim through can_view would issue one role/profile lookup per visible expense."""
+    from app.assistant.adapters import install_production_adapters
+
+    db.add_all([
+        Department(id="dept-a", name="研发", code="RND"),
+        User(id="actor", username="actor", password_encrypted="secret", role=actor_role, department_id="dept-a"),
+    ])
+    if actor_role == "finance":
+        db.add(UserRole(user_id="actor", role="finance"))
+    db.add_all([
+        User(id=f"claimant-{index:02d}", username=f"claimant-{index:02d}", password_encrypted="secret", role="employee")
+        for index in range(50)
+    ])
+    if actor_role == "manager":
+        db.add_all([
+            EmployeeProfile(user_id=f"claimant-{index:02d}", full_name=f"申请人 {index:02d}", manager_id="actor")
+            for index in range(50)
+        ])
+    db.add_all([
+        ExpenseClaim(
+            id=f"expense-{index:02d}",
+            claim_no=f"EXP-{index:02d}",
+            requester_id=f"claimant-{index:02d}",
+            department_id="dept-a",
+            title=f"费用 {index:02d}",
+        )
+        for index in range(50)
+    ])
+    db.flush()
+    db.expire_all()
+    install_production_adapters()
+    statements: list[str] = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement.upper())
+
+    event.listen(db.bind, "before_cursor_execute", capture)
+    try:
+        result = _adapter("list_expenses")(
+            db,
+            _principal(user_id="actor", role=actor_role, department_ids=("dept-a",)),
+            _payload("list_expenses"),
+        )
+    finally:
+        event.remove(db.bind, "before_cursor_execute", capture)
+
+    assert len(result["items"]) == 50
+    assert sum("FROM USER_ROLES" in statement for statement in statements) <= 1
+    assert sum("FROM EMPLOYEE_PROFILES" in statement for statement in statements) <= 1
+
+
+def test_approval_list_omits_unbounded_task_history_but_keeps_department(db):
+    """Ranking every task in an instance history would make one approval result read unbounded history."""
+    from app.assistant.adapters import install_production_adapters
+
+    db.add_all([
+        Department(id="dept-a", name="研发", code="RND"),
+        User(id="requester", username="requester", password_encrypted="secret", role="manager", department_id="dept-a"),
+        WorkflowDefinition(id="flow-1", code="flow-1", name="审批流", version=1, active=True),
+        WorkflowNode(id="node-1", definition_id="flow-1", sequence=1, name="审批", assignee_type="role", assignee_role="manager"),
+        ApprovalInstance(id="approval-1", definition_id="flow-1", entity_type="project", entity_id="project-1", requester_id="requester"),
+    ])
+    db.add_all([
+        ApprovalTask(
+            id=f"task-{index:04d}",
+            instance_id="approval-1",
+            node_id="node-1",
+            sequence=index,
+            assignee_role="manager",
+            department_id="dept-a",
+        )
+        for index in range(200)
+    ])
+    db.flush()
+    install_production_adapters()
+    statements: list[str] = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement.upper())
+
+    event.listen(db.bind, "before_cursor_execute", capture)
+    try:
+        result = _adapter("list_approvals")(
+            db,
+            _principal(user_id="requester", role="manager", department_ids=("dept-a",)),
+            _payload("list_approvals"),
+        )
+    finally:
+        event.remove(db.bind, "before_cursor_execute", capture)
+
+    assert len(result["items"]) == 1
+    item = result["items"][0]
+    assert item["id"] == "approval-1"
+    assert item["department_id"] == "dept-a"
+    assert item["requester_name"] == "requester"
+    assert "tasks" not in item
+    assert not any("ROW_NUMBER" in statement for statement in statements)
