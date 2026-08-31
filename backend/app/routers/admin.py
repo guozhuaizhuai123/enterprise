@@ -440,9 +440,9 @@ def update_document(document_id: str, payload: DocumentUpdate, db: Session = Dep
         content=payload.content,
         owner_id=payload.owner_id,
         owner_name=owner_name,
+        project_id=next_project_id,
+        contract_id=next_contract_id,
     )
-    doc.project_id = next_project_id
-    doc.contract_id = next_contract_id
     db.commit()
     db.refresh(doc)
     return _document_out(doc, detail=True)

@@ -132,6 +132,8 @@ def create_employee_document(
         project_id=project_id,
         contract_id=contract_id,
     )
+    db.commit()
+    db.refresh(doc)
     return _document_out(doc, detail=True)
 
 
@@ -161,9 +163,9 @@ def update_employee_document(
         category=payload.category,
         sensitive=payload.sensitive,
         content=payload.content,
+        project_id=next_project_id,
+        contract_id=next_contract_id,
     )
-    document.project_id = next_project_id
-    document.contract_id = next_contract_id
     db.commit()
     db.refresh(document)
     return _document_out(document, detail=True)
@@ -183,3 +185,4 @@ def delete_employee_document(
     except PermissionError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
     service.delete_document(db, document)
+    db.commit()
