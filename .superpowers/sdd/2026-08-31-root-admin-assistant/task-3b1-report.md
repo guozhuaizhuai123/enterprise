@@ -60,3 +60,43 @@ $ /Users/guozhuaizhuai/Desktop/enterprise-kb-system/backend/.venv/bin/python -m 
   `/Users/guozhuaizhuai/Desktop/enterprise-kb-system/backend/.venv/bin/python`;
   `pytest` was installed there because it was missing.
 - Existing Pydantic class-based-config deprecation warnings remain unchanged.
+
+## Follow-up review fix
+
+The follow-up addresses the read-scaling review findings without changing the
+registered action set or response projections:
+
+- Expense, approval, and ticket visibility is now applied to a database-bounded
+  page before result projection. Expense rows retain a final
+  `ExpenseService.can_view` defense-in-depth check.
+- Approval task payloads are fetched in one windowed, at-most-ten-per-instance
+  query; user and department labels are prefetched into maps for each bounded
+  page. The project and contract adapters also use user maps rather than
+  per-row lookups.
+- The approval SQL mirrors current requester, administrator/HR, pending-inbox,
+  scoped-role, and explicitly assigned-task visibility semantics.
+
+### Follow-up RED
+
+The added scale regressions failed against the original adapter implementation:
+
+```text
+4 failed, 5 passed
+- list_expenses/list_approvals/list_tickets base selects had no LIMIT
+- a 50-row project/approval page issued 100 SELECT ... FROM users statements
+```
+
+### Follow-up GREEN
+
+```text
+$ /Users/guozhuaizhuai/Desktop/enterprise-kb-system/backend/.venv/bin/python -m pytest tests/test_assistant_adapters.py -q
+.........                                                                [100%]
+9 passed, 11 warnings in 2.89s
+```
+
+### Follow-up full suite
+
+```text
+$ /Users/guozhuaizhuai/Desktop/enterprise-kb-system/backend/.venv/bin/python -m pytest -q
+215 passed, 11 warnings, 3 subtests passed in 5.60s
+```

@@ -9,15 +9,27 @@ from decimal import Decimal
 from typing import Any
 
 from fastapi import HTTPException, status
+from sqlalchemy import exists, func, or_, select
+
 from app.access import resolve_department_scope
 from app.assistant.service import register_action_adapter
 from app.deps import Principal
 from app.expense.service import ExpenseService
 from app.kb import retriever
 from app.kb.retriever import RetrievedChunk
-from app.models import ApprovalInstance, ApprovalTask, Contract, Department, Document, ExpenseClaim, Project, Ticket, User
-from app.routers.approvals import _can_view as approval_can_view
-from app.routers.tickets import _can_view as ticket_can_view
+from app.models import (
+    ApprovalInstance,
+    ApprovalTask,
+    Contract,
+    Department,
+    Document,
+    EmployeeProfile,
+    ExpenseClaim,
+    Project,
+    Ticket,
+    User,
+    UserRole,
+)
 
 
 _MAX_ITEMS = 50
@@ -67,9 +79,24 @@ def _query(payload: dict[str, Any]) -> str:
     return str(payload.get("query") or "").strip()
 
 
-def _user_name(session: Any, user_id: str | None) -> str:
-    user = session.get(User, user_id) if user_id else None
-    return user.username if user else ""
+def _user_details(session: Any, user_ids: set[str | None]) -> dict[str, tuple[str, str | None]]:
+    ids = {user_id for user_id in user_ids if user_id}
+    if not ids:
+        return {}
+    return {
+        row.id: (row.username, row.department_id)
+        for row in session.query(User).filter(User.id.in_(ids)).all()
+    }
+
+
+def _department_names(session: Any, department_ids: set[str | None]) -> dict[str, str]:
+    ids = {department_id for department_id in department_ids if department_id}
+    if not ids:
+        return {}
+    return {
+        row.id: row.name
+        for row in session.query(Department).filter(Department.id.in_(ids)).all()
+    }
 
 
 def _search_knowledge(session: Any, principal: Principal, payload: dict[str, Any]) -> dict[str, Any]:
@@ -140,7 +167,8 @@ def _list_projects(session: Any, principal: Principal, payload: dict[str, Any]) 
         like = f"%{text}%"
         query = query.filter(Project.name.ilike(like) | Project.code.ilike(like))
     rows = query.order_by(Project.created_at.desc(), Project.id.desc()).limit(_MAX_ITEMS).all()
-    departments = {row.id: row.name for row in session.query(Department).filter(Department.id.in_([item.department_id for item in rows if item.department_id])).all()}
+    departments = _department_names(session, {row.department_id for row in rows})
+    users = _user_details(session, {row.manager_id for row in rows})
     return _result([
         {
             "id": row.id,
@@ -151,7 +179,7 @@ def _list_projects(session: Any, principal: Principal, payload: dict[str, Any]) 
             "department_id": row.department_id,
             "department_name": departments.get(row.department_id, ""),
             "manager_id": row.manager_id,
-            "manager_name": _user_name(session, row.manager_id),
+            "manager_name": users.get(row.manager_id, ("", None))[0],
             "start_date": _json_value(row.start_date),
             "end_date": _json_value(row.end_date),
             "budget": _json_value(row.budget),
@@ -176,7 +204,11 @@ def _list_contracts(session: Any, principal: Principal, payload: dict[str, Any])
             Contract.name.ilike(like) | Contract.code.ilike(like) | Contract.party_a.ilike(like) | Contract.party_b.ilike(like)
         )
     rows = query.order_by(Contract.created_at.desc(), Contract.id.desc()).limit(_MAX_ITEMS).all()
-    projects = {row.id: row.name for row in session.query(Project).filter(Project.id.in_([item.project_id for item in rows if item.project_id])).all()}
+    projects = {
+        row.id: row.name
+        for row in session.query(Project).filter(Project.id.in_({item.project_id for item in rows if item.project_id})).all()
+    }
+    users = _user_details(session, {row.owner_id for row in rows})
     return _result([
         {
             "id": row.id,
@@ -194,7 +226,7 @@ def _list_contracts(session: Any, principal: Principal, payload: dict[str, Any])
             "effective_date": _json_value(row.effective_date),
             "expiry_date": _json_value(row.expiry_date),
             "owner_id": row.owner_id,
-            "owner_name": _user_name(session, row.owner_id),
+            "owner_name": users.get(row.owner_id, ("", None))[0],
             "created_at": _json_value(row.created_at),
             "updated_at": _json_value(row.updated_at),
         }
@@ -215,14 +247,36 @@ def _list_expenses(session: Any, principal: Principal, payload: dict[str, Any]) 
         query = query.filter(
             ExpenseClaim.claim_no.ilike(like) | ExpenseClaim.title.ilike(like) | ExpenseClaim.purpose.ilike(like)
         )
-    rows = query.order_by(ExpenseClaim.created_at.desc(), ExpenseClaim.id.desc()).all()
-    departments = {row.id: row.name for row in session.query(Department).filter(Department.id.in_([item.department_id for item in rows if item.department_id])).all()}
+    actor = session.get(User, principal.user_id)
+    visibility = [ExpenseClaim.requester_id == principal.user_id]
+    if actor is not None:
+        if actor.role == "admin":
+            visibility = []
+        else:
+            visibility.extend([
+                ExpenseClaim.requester_id.in_(
+                    select(EmployeeProfile.user_id).where(EmployeeProfile.manager_id == principal.user_id)
+                ),
+                exists().where(
+                    UserRole.user_id == principal.user_id,
+                    UserRole.role.in_(("hr", "finance")),
+                    or_(
+                        UserRole.department_id.is_(None),
+                        UserRole.department_id == ExpenseClaim.department_id,
+                    ),
+                ),
+            ])
+    if visibility:
+        query = query.filter(or_(*visibility))
+    rows = query.order_by(ExpenseClaim.created_at.desc(), ExpenseClaim.id.desc()).limit(_MAX_ITEMS).all()
+    departments = _department_names(session, {row.department_id for row in rows})
+    users = _user_details(session, {row.requester_id for row in rows})
     return _result([
         {
             "id": row.id,
             "claim_no": row.claim_no,
             "requester_id": row.requester_id,
-            "requester_name": _user_name(session, row.requester_id),
+            "requester_name": users.get(row.requester_id, ("", None))[0],
             "department_id": row.department_id,
             "department_name": departments.get(row.department_id, ""),
             "title": row.title,
@@ -240,17 +294,86 @@ def _list_expenses(session: Any, principal: Principal, payload: dict[str, Any]) 
     ])
 
 
-def _approval_department_id(session: Any, instance: ApprovalInstance) -> str | None:
-    task = (
-        session.query(ApprovalTask)
-        .filter(ApprovalTask.instance_id == instance.id)
+def _approval_department_expression() -> Any:
+    first_task_department = (
+        select(ApprovalTask.department_id)
+        .where(ApprovalTask.instance_id == ApprovalInstance.id)
         .order_by(ApprovalTask.sequence, ApprovalTask.id)
-        .first()
+        .limit(1)
+        .scalar_subquery()
     )
-    if task and task.department_id:
-        return task.department_id
-    requester = session.get(User, instance.requester_id)
-    return requester.department_id if requester else None
+    requester_department = (
+        select(User.department_id)
+        .where(User.id == ApprovalInstance.requester_id)
+        .scalar_subquery()
+    )
+    return func.coalesce(first_task_department, requester_department)
+
+
+def _approval_visibility_expression(principal: Principal) -> Any | None:
+    if principal.has_role("admin", "hr"):
+        return None
+    effective_roles = tuple(sorted(set(principal.roles) | {principal.role}))
+    department_ids = tuple(principal.department_ids) or ("",)
+    role_assignment = (
+        ApprovalTask.assignee_role.in_(effective_roles)
+        & or_(
+            ApprovalTask.department_id.is_(None),
+            ApprovalTask.department_id.in_(department_ids),
+            exists().where(
+                UserRole.user_id == principal.user_id,
+                UserRole.role == ApprovalTask.assignee_role,
+                or_(
+                    UserRole.department_id.is_(None),
+                    UserRole.department_id == ApprovalTask.department_id,
+                ),
+            ),
+        )
+    )
+    pending_inbox = exists().where(
+        ApprovalTask.instance_id == ApprovalInstance.id,
+        ApprovalTask.status == "pending",
+        ApprovalInstance.status == "pending_approval",
+        or_(ApprovalTask.assignee_id == principal.user_id, role_assignment),
+    )
+    assigned_task = exists().where(
+        ApprovalTask.instance_id == ApprovalInstance.id,
+        ApprovalTask.assignee_id == principal.user_id,
+    )
+    return or_(
+        ApprovalInstance.requester_id == principal.user_id,
+        pending_inbox,
+        assigned_task,
+    )
+
+
+def _tasks_by_instance(session: Any, instance_ids: set[str]) -> dict[str, list[ApprovalTask]]:
+    if not instance_ids:
+        return {}
+    ranked = (
+        select(
+            ApprovalTask.id,
+            func.row_number()
+            .over(
+                partition_by=ApprovalTask.instance_id,
+                order_by=(ApprovalTask.sequence, ApprovalTask.id),
+            )
+            .label("position"),
+        )
+        .where(ApprovalTask.instance_id.in_(instance_ids))
+        .subquery()
+    )
+    rows = (
+        session.query(ApprovalTask)
+        .join(ranked, ApprovalTask.id == ranked.c.id)
+        .filter(ranked.c.position <= 10)
+        .order_by(ApprovalTask.instance_id, ApprovalTask.sequence, ApprovalTask.id)
+        .all()
+    )
+    result: dict[str, list[ApprovalTask]] = {}
+    for row in rows:
+        result.setdefault(row.instance_id, []).append(row)
+    return result
 
 
 def _list_approvals(session: Any, principal: Principal, payload: dict[str, Any]) -> dict[str, Any]:
@@ -267,27 +390,25 @@ def _list_approvals(session: Any, principal: Principal, payload: dict[str, Any])
             | ApprovalInstance.entity_type.ilike(like)
             | ApprovalInstance.entity_id.ilike(like)
         )
-    rows = query.order_by(ApprovalInstance.submitted_at.desc(), ApprovalInstance.id.desc()).all()
+    department_expression = _approval_department_expression()
+    if requested_department_id:
+        query = query.filter(department_expression == requested_department_id)
+    visibility = _approval_visibility_expression(principal)
+    if visibility is not None:
+        query = query.filter(visibility)
+    rows = query.order_by(ApprovalInstance.submitted_at.desc(), ApprovalInstance.id.desc()).limit(_MAX_ITEMS).all()
+    tasks_by_instance = _tasks_by_instance(session, {row.id for row in rows})
+    users = _user_details(session, {row.requester_id for row in rows})
     items: list[dict[str, Any]] = []
     for row in rows:
-        department_id = _approval_department_id(session, row)
-        if requested_department_id and department_id != requested_department_id:
-            continue
-        if not approval_can_view(session, row, principal):
-            continue
-        tasks = (
-            session.query(ApprovalTask)
-            .filter(ApprovalTask.instance_id == row.id)
-            .order_by(ApprovalTask.sequence, ApprovalTask.id)
-            .limit(10)
-            .all()
-        )
+        tasks = tasks_by_instance.get(row.id, [])
+        department_id = tasks[0].department_id if tasks and tasks[0].department_id else users.get(row.requester_id, ("", None))[1]
         items.append({
             "id": row.id,
             "entity_type": row.entity_type,
             "entity_id": row.entity_id,
             "requester_id": row.requester_id,
-            "requester_name": _user_name(session, row.requester_id),
+            "requester_name": users.get(row.requester_id, ("", None))[0],
             "department_id": department_id,
             "status": row.status,
             "current_node_sequence": row.current_node_sequence,
@@ -308,8 +429,6 @@ def _list_approvals(session: Any, principal: Principal, payload: dict[str, Any])
                 for task in tasks
             ],
         })
-        if len(items) == _MAX_ITEMS:
-            break
     return _result(items)
 
 
@@ -324,18 +443,24 @@ def _list_tickets(session: Any, principal: Principal, payload: dict[str, Any]) -
     if text:
         like = f"%{text}%"
         query = query.filter(Ticket.subject.ilike(like) | Ticket.description.ilike(like))
-    rows = query.order_by(Ticket.created_at.desc(), Ticket.id.desc()).all()
-    departments = {row.id: row.name for row in session.query(Department).filter(Department.id.in_([item.department_id for item in rows if item.department_id])).all()}
-    items: list[dict[str, Any]] = []
-    for row in rows:
-        if not ticket_can_view(session, principal, row):
-            continue
-        items.append({
+    if principal.role != "admin":
+        query = query.filter(
+            or_(
+                Ticket.requester_id == principal.user_id,
+                Ticket.target_user_id == principal.user_id,
+                Ticket.target_user_id.is_(None) & Ticket.department_id.in_(principal.department_ids or ("",)),
+            )
+        )
+    rows = query.order_by(Ticket.created_at.desc(), Ticket.id.desc()).limit(_MAX_ITEMS).all()
+    departments = _department_names(session, {row.department_id for row in rows})
+    users = _user_details(session, {row.requester_id for row in rows} | {row.target_user_id for row in rows})
+    items = [
+        {
             "id": row.id,
             "requester_id": row.requester_id,
-            "requester_name": _user_name(session, row.requester_id),
+            "requester_name": users.get(row.requester_id, ("", None))[0],
             "target_user_id": row.target_user_id,
-            "target_user_name": _user_name(session, row.target_user_id),
+            "target_user_name": users.get(row.target_user_id, ("", None))[0],
             "department_id": row.department_id,
             "department_name": departments.get(row.department_id, ""),
             "requested_department_id": row.requested_department_id,
@@ -347,9 +472,9 @@ def _list_tickets(session: Any, principal: Principal, payload: dict[str, Any]) -
             "created_at": _json_value(row.created_at),
             "updated_at": _json_value(row.updated_at),
             "closed_at": _json_value(row.closed_at),
-        })
-        if len(items) == _MAX_ITEMS:
-            break
+        }
+        for row in rows
+    ]
     return _result(items)
 
 

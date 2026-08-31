@@ -2,7 +2,7 @@ import json
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine
+from sqlalchemy import event, create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -12,6 +12,7 @@ from app.db import Base
 from app.deps import Principal
 from app.models import (
     ApprovalInstance,
+    ApprovalTask,
     Department,
     EmployeeProfile,
     ExpenseClaim,
@@ -20,6 +21,7 @@ from app.models import (
     User,
     UserDepartment,
     WorkflowDefinition,
+    WorkflowNode,
 )
 
 
@@ -196,3 +198,145 @@ def test_project_results_are_bounded_json_only_and_do_not_serialize_secret_field
     assert len(result["items"]) == 50
     assert {"password", "password_encrypted", "token", "content", "salary"}.isdisjoint(result["items"][0])
     json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    ("action_name", "table_name"),
+    [
+        ("list_expenses", "expense_claims"),
+        ("list_approvals", "approval_instances"),
+        ("list_tickets", "tickets"),
+    ],
+)
+def test_sensitive_and_workflow_lists_limit_the_database_page_before_visibility_projection(
+    db, action_name, table_name
+):
+    """Removing a database limit would materialize every matching sensitive row before authorization."""
+    from app.assistant.adapters import install_production_adapters
+
+    db.add_all([
+        Department(id="dept-a", name="研发", code="RND"),
+        User(id="root", username="root", password_encrypted="secret", role="admin"),
+        WorkflowDefinition(id="flow-1", code="flow-1", name="审批流", version=1, active=True),
+    ])
+    db.add_all(
+        [
+            ExpenseClaim(
+                id=f"expense-{index:02d}",
+                claim_no=f"EXP-{index:02d}",
+                requester_id="root",
+                department_id="dept-a",
+                title=f"费用 {index:02d}",
+            )
+            for index in range(51)
+        ]
+        + [
+            ApprovalInstance(
+                id=f"approval-{index:02d}",
+                definition_id="flow-1",
+                entity_type="expense_claim",
+                entity_id=f"expense-{index:02d}",
+                requester_id="root",
+            )
+            for index in range(51)
+        ]
+        + [
+            Ticket(
+                id=f"ticket-{index:02d}",
+                requester_id="root",
+                department_id="dept-a",
+                ticket_type="issue",
+                subject=f"工单 {index:02d}",
+                description="详情",
+                status="in_progress",
+            )
+            for index in range(51)
+        ]
+    )
+    db.flush()
+    install_production_adapters()
+    statements: list[str] = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement.upper())
+
+    event.listen(db.bind, "before_cursor_execute", capture)
+    try:
+        result = _adapter(action_name)(db, _principal(user_id="root"), _payload(action_name))
+    finally:
+        event.remove(db.bind, "before_cursor_execute", capture)
+
+    base_queries = [statement for statement in statements if f"FROM {table_name.upper()}" in statement]
+    assert len(result["items"]) == 50
+    assert base_queries
+    assert any("LIMIT" in statement for statement in base_queries)
+
+
+def test_project_and_approval_pages_prefetch_related_rows_in_constant_query_batches(db):
+    """Replacing prefetched maps with per-row lookups would turn a 50-row page into N+1 database queries."""
+    from app.assistant.adapters import install_production_adapters
+
+    db.add_all([
+        Department(id="dept-a", name="研发", code="RND"),
+        User(id="viewer", username="viewer", password_encrypted="secret", role="manager", department_id="dept-a"),
+        WorkflowDefinition(id="flow-1", code="flow-1", name="审批流", version=1, active=True),
+        WorkflowNode(id="node-1", definition_id="flow-1", sequence=1, name="审批", assignee_type="role", assignee_role="manager"),
+    ])
+    db.add_all(
+        [
+            User(id=f"manager-{index:02d}", username=f"manager-{index:02d}", password_encrypted="secret", role="manager")
+            for index in range(50)
+        ]
+        + [
+            Project(
+                id=f"project-{index:02d}",
+                code=f"P-{index:02d}",
+                name=f"项目 {index:02d}",
+                department_id="dept-a",
+                manager_id=f"manager-{index:02d}",
+            )
+            for index in range(50)
+        ]
+        + [
+            ApprovalInstance(
+                id=f"approval-{index:02d}",
+                definition_id="flow-1",
+                entity_type="project",
+                entity_id=f"project-{index:02d}",
+                requester_id="viewer",
+            )
+            for index in range(50)
+        ]
+        + [
+            ApprovalTask(
+                id=f"task-{index:02d}",
+                instance_id=f"approval-{index:02d}",
+                node_id="node-1",
+                sequence=1,
+                assignee_role="manager",
+                department_id="dept-a",
+            )
+            for index in range(50)
+        ]
+    )
+    db.flush()
+    db.expire_all()
+    install_production_adapters()
+    statements: list[str] = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement.upper())
+
+    event.listen(db.bind, "before_cursor_execute", capture)
+    try:
+        projects = _adapter("list_projects")(db, _principal(user_id="viewer", role="manager", department_ids=("dept-a",)), _payload("list_projects"))
+        approvals = _adapter("list_approvals")(db, _principal(user_id="viewer", role="manager", department_ids=("dept-a",)), _payload("list_approvals"))
+    finally:
+        event.remove(db.bind, "before_cursor_execute", capture)
+
+    assert len(projects["items"]) == 50
+    assert len(approvals["items"]) == 50
+    assert sum("FROM USERS" in statement for statement in statements) <= 2
+    assert sum("FROM APPROVAL_TASKS" in statement for statement in statements) <= 2
