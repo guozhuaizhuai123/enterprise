@@ -16,6 +16,7 @@ from app.kb import service as kb_service
 from app.organization.service import OrganizationService
 from app.payroll.service import PayrollService
 from app.schedule.service import create_leave_request
+from app.models import ApprovalInstance, Contract, Department, Document, ExpenseClaim, Project, Ticket
 from app.schemas import (
     ApprovalDecisionIn,
     ContractCreate,
@@ -102,6 +103,7 @@ class ActionDefinition:
     preview: ActionHandler
     execute: ActionHandler
     sensitive_read: bool = False
+    target_model: type[Any] | None = None
 
 
 def _metadata(
@@ -112,6 +114,7 @@ def _metadata(
     *,
     execute: ActionHandler = _not_executable_yet,
     sensitive_read: bool = False,
+    target_model: type[Any] | None = None,
 ) -> ActionDefinition:
     return ActionDefinition(
         name=name,
@@ -121,6 +124,7 @@ def _metadata(
         preview=_not_executable_yet,
         execute=execute,
         sensitive_read=sensitive_read,
+        target_model=target_model,
     )
 
 
@@ -135,27 +139,27 @@ _ACTIONS: tuple[ActionDefinition, ...] = (
     _metadata("list_approvals", QueryInput, ("admin", "hr", "finance", "manager"), "sensitive", sensitive_read=True),
     _metadata("list_tickets", QueryInput, ("admin", "hr", "manager"), "low"),
     _metadata("create_org_unit", OrgUnitCreate, ("admin", "hr"), "high", execute=OrganizationService.create_org_unit),
-    _metadata("update_org_unit", OrgUnitTargetUpdate, ("admin", "hr"), "high", execute=OrganizationService.update_org_unit),
+    _metadata("update_org_unit", OrgUnitTargetUpdate, ("admin", "hr"), "high", execute=OrganizationService.update_org_unit, target_model=Department),
     _metadata("create_project", ProjectCreate, ("admin", "hr", "manager"), "high"),
-    _metadata("update_project", ProjectTargetUpdate, ("admin", "hr", "manager"), "high"),
+    _metadata("update_project", ProjectTargetUpdate, ("admin", "hr", "manager"), "high", target_model=Project),
     _metadata("create_contract", ContractCreate, ("admin", "hr", "manager"), "high"),
-    _metadata("update_contract", ContractTargetUpdate, ("admin", "hr", "manager"), "high"),
+    _metadata("update_contract", ContractTargetUpdate, ("admin", "hr", "manager"), "high", target_model=Contract),
     _metadata("create_document", DocumentCreate, ("admin",), "high", execute=kb_service.create_document),
-    _metadata("update_document", DocumentTargetUpdate, ("admin",), "high", execute=kb_service.update_document),
+    _metadata("update_document", DocumentTargetUpdate, ("admin",), "high", execute=kb_service.update_document, target_model=Document),
     _metadata("create_expense_draft", ExpenseClaimCreate, ("admin", "employee", "hr", "manager", "finance"), "high", execute=ExpenseService.create_draft),
-    _metadata("update_expense_draft", ExpenseDraftTargetUpdate, ("admin", "employee", "hr", "manager", "finance"), "high", execute=ExpenseService.update_draft),
+    _metadata("update_expense_draft", ExpenseDraftTargetUpdate, ("admin", "employee", "hr", "manager", "finance"), "high", execute=ExpenseService.update_draft, target_model=ExpenseClaim),
     _metadata("create_leave_request", LeaveRequestCreate, ("admin", "employee", "hr", "manager", "finance"), "high", execute=create_leave_request),
     _metadata("create_ticket", TicketCreate, ("admin", "employee", "hr", "manager", "finance"), "high"),
-    _metadata("approve_approval", ApprovalActionInput, ("admin", "hr", "manager", "finance"), "high", execute=WorkflowService.act),
-    _metadata("reject_approval", ApprovalActionInput, ("admin", "hr", "manager", "finance"), "high", execute=WorkflowService.act),
-    _metadata("cancel_approval", ApprovalActionInput, ("admin", "hr", "manager", "finance"), "high", execute=WorkflowService.act),
-    _metadata("pay_expense", PaymentActionInput, ("admin", "finance"), "high", execute=ExpenseService.pay),
+    _metadata("approve_approval", ApprovalActionInput, ("admin", "hr", "manager", "finance"), "high", execute=WorkflowService.act, target_model=ApprovalInstance),
+    _metadata("reject_approval", ApprovalActionInput, ("admin", "hr", "manager", "finance"), "high", execute=WorkflowService.act, target_model=ApprovalInstance),
+    _metadata("cancel_approval", ApprovalActionInput, ("admin", "hr", "manager", "finance"), "high", execute=WorkflowService.act, target_model=ApprovalInstance),
+    _metadata("pay_expense", PaymentActionInput, ("admin", "finance"), "high", execute=ExpenseService.pay, target_model=ExpenseClaim),
     _metadata("generate_payroll", PayrollGenerateIn, ("admin",), "batch", execute=PayrollService.generate_run),
-    _metadata("delete_project", EntityInput, ("admin", "hr", "manager"), "high"),
-    _metadata("delete_contract", EntityInput, ("admin", "hr", "manager"), "high"),
-    _metadata("delete_document", EntityInput, ("admin",), "high", execute=kb_service.delete_document),
-    _metadata("delete_expense_draft", EntityInput, ("admin", "employee", "hr", "manager", "finance"), "high", execute=ExpenseService.delete_draft),
-    _metadata("delete_ticket", EntityInput, ("admin",), "high"),
+    _metadata("delete_project", EntityInput, ("admin", "hr", "manager"), "high", target_model=Project),
+    _metadata("delete_contract", EntityInput, ("admin", "hr", "manager"), "high", target_model=Contract),
+    _metadata("delete_document", EntityInput, ("admin",), "high", execute=kb_service.delete_document, target_model=Document),
+    _metadata("delete_expense_draft", EntityInput, ("admin", "employee", "hr", "manager", "finance"), "high", execute=ExpenseService.delete_draft, target_model=ExpenseClaim),
+    _metadata("delete_ticket", EntityInput, ("admin",), "high", target_model=Ticket),
 )
 
 _ACTION_BY_NAME = {action.name: action for action in _ACTIONS}

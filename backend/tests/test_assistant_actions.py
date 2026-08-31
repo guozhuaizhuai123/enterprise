@@ -12,7 +12,7 @@ from app.db import Base
 from app.assistant.planner import ActionPlan
 import app.assistant.service as assistant_service
 from app.assistant import registry
-from app.assistant.registry import ActionDefinition, get_action
+from app.assistant.registry import ActionDefinition, get_action, list_actions
 from app.assistant.schemas import ActionChange, ActionConfirmRequest, ActionPreview, ActionResult
 from app.assistant.service import create_preview
 from app.deps import Principal
@@ -726,25 +726,20 @@ def test_post_claim_target_recheck_blocks_interleaved_change_before_adapter(tmp_
 
 def test_every_existing_target_mutation_is_id_bound_and_version_or_snapshot_checked():
     """Adding a mutable catalog action without this mapping would silently recreate the stale-target bypass."""
-    target_mutations = {
+    target_writes = {
         "approve_approval",
         "reject_approval",
         "cancel_approval",
-        "update_org_unit",
-        "update_project",
-        "update_contract",
-        "update_document",
-        "update_expense_draft",
-        "delete_project",
-        "delete_contract",
-        "delete_document",
-        "delete_expense_draft",
-        "delete_ticket",
         "pay_expense",
     }
+    target_writes.update(
+        definition.name
+        for definition in list_actions()
+        if definition.name.startswith(("update_", "delete_"))
+    )
 
-    assert target_mutations == set(assistant_service._VERSIONED_ACTION_MODELS)
-    for action_name in target_mutations:
-        definition = get_action(action_name)
-        assert definition is not None
+    for definition in list_actions():
+        if definition.name not in target_writes:
+            continue
+        assert definition.target_model is not None
         assert definition.input_model.model_fields["id"].is_required()

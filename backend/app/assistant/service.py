@@ -22,7 +22,7 @@ from app.assistant.registry import ActionDefinition, get_action
 from app.assistant.schemas import ActionConfirmRequest, ActionPreview, ActionResult
 from app.audit.service import AuditService
 from app.deps import Principal
-from app.models import ApprovalInstance, AssistantAction, Contract, Department, Document, ExpenseClaim, Project, Ticket
+from app.models import AssistantAction
 
 
 _PREVIEW_TTL = timedelta(minutes=5)
@@ -31,22 +31,6 @@ _CONFIRMATION_POLICY: dict[str, tuple[str | None, bool, int]] = {
     "sensitive": ("确认查看", True, 1),
     "high": ("确认执行", True, 1),
     "batch": ("确认批量执行", True, 2),
-}
-_VERSIONED_ACTION_MODELS = {
-    "approve_approval": ApprovalInstance,
-    "reject_approval": ApprovalInstance,
-    "cancel_approval": ApprovalInstance,
-    "update_org_unit": Department,
-    "update_expense_draft": ExpenseClaim,
-    "delete_expense_draft": ExpenseClaim,
-    "pay_expense": ExpenseClaim,
-    "update_project": Project,
-    "delete_project": Project,
-    "update_contract": Contract,
-    "delete_contract": Contract,
-    "update_document": Document,
-    "delete_document": Document,
-    "delete_ticket": Ticket,
 }
 ActionAdapter = Callable[[Session, Principal, dict[str, Any]], Any]
 _ACTION_ADAPTERS: dict[str, ActionAdapter] = {}
@@ -87,7 +71,7 @@ def _object_versions(
     db: Session, definition: ActionDefinition, payload: dict[str, Any], *, lock_target: bool = False
 ) -> dict[str, int | str]:
     """Resolve a target revision or deterministic snapshot for a mutable action."""
-    model = _VERSIONED_ACTION_MODELS.get(definition.name)
+    model = definition.target_model
     object_id = payload.get("id")
     if model is None or not isinstance(object_id, str):
         return {}
