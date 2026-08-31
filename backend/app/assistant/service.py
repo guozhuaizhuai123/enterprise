@@ -3,7 +3,7 @@
 This module deliberately creates only an auditable preview.  Confirmation and
 business execution are introduced by later slices.
 """
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.assistant.planner import ActionPlan
 from app.assistant.registry import ActionDefinition, get_action
-from app.assistant.schemas import ActionPreview
+from app.assistant.schemas import ActionConfirmRequest, ActionPreview, ActionResult
 from app.audit.service import AuditService
 from app.deps import Principal
 from app.models import ApprovalInstance, AssistantAction, ExpenseClaim
@@ -39,6 +39,8 @@ _VERSIONED_ACTION_MODELS = {
     "delete_expense_draft": ExpenseClaim,
     "pay_expense": ExpenseClaim,
 }
+ActionAdapter = Callable[[Session, Principal, dict[str, Any]], Any]
+_ACTION_ADAPTERS: dict[str, ActionAdapter] = {}
 
 
 def _normalize_json(value: Any) -> Any:
@@ -166,3 +168,286 @@ def create_preview(db: Session, principal: Principal, thread_id: str | None, pla
         },
     )
     return preview
+
+
+def register_action_adapter(tool_name: str, adapter: ActionAdapter) -> None:
+    """Register a server-owned adapter for one exact catalog action name."""
+    if get_action(tool_name) is None:
+        raise ValueError("assistant action is not registered")
+    if not callable(adapter):
+        raise TypeError("assistant action adapter must be callable")
+    _ACTION_ADAPTERS[tool_name] = adapter
+
+
+def _now_utc() -> datetime:
+    return datetime.now(UTC)
+
+
+def _is_expired(action: AssistantAction) -> bool:
+    if action.expires_at is None:
+        return False
+    expires_at = action.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    return expires_at <= _now_utc()
+
+
+def is_confirmation_valid(
+    action: AssistantAction, principal: Principal, request: ActionConfirmRequest
+) -> tuple[bool, str | None]:
+    """Check request-bound confirmation facts that do not require a database read."""
+    if action.user_id != principal.user_id:
+        return False, "owner_mismatch"
+    if action.status != "preview":
+        return False, "confirmation_not_available"
+    if request.action_id != action.id:
+        return False, "action_id_mismatch"
+    if request.parameter_hash != action.parameter_hash:
+        return False, "parameter_hash_mismatch"
+    if action.confirmation_phrase != request.confirmation_phrase:
+        return False, "confirmation_phrase_mismatch"
+    if _is_expired(action):
+        return False, "action_expired"
+    return True, None
+
+
+def _result(
+    action: AssistantAction, *, status_value: str | None = None, error_code: str | None = None
+) -> ActionResult:
+    return ActionResult(
+        action_id=action.id,
+        status=status_value or action.status,
+        result=action.result_json,
+        error_code=error_code if error_code is not None else action.error_code,
+    )
+
+
+def _preview_from_action(action: AssistantAction, definition: ActionDefinition) -> ActionPreview:
+    """Rebuild the public preview from persisted data after a batch confirmation."""
+    preview_data = dict(action.preview_json or {})
+    return ActionPreview(
+        action_id=action.id,
+        tool_name=action.tool_name,
+        risk_level=definition.risk_level,
+        summary=str(preview_data.get("summary", action.tool_name)),
+        changes=preview_data.get("changes", []),
+        confirmation_phrase=action.confirmation_phrase,
+        requires_confirmation=_CONFIRMATION_POLICY[definition.risk_level][1],
+        confirmation_step=int(preview_data.get("confirmation_step", 0)),
+        confirmation_steps_required=_CONFIRMATION_POLICY[definition.risk_level][2],
+        expires_at=action.expires_at,
+        parameter_hash=action.parameter_hash,
+    )
+
+
+def _record_rejection(db: Session, principal: Principal, action: AssistantAction, error_code: str) -> None:
+    AuditService.record(
+        db,
+        principal,
+        "assistant_action_confirmation_rejected",
+        "assistant_action",
+        action.id,
+        after={"error_code": error_code},
+    )
+
+
+def _expire_action(db: Session, principal: Principal, action: AssistantAction) -> ActionResult:
+    if action.status != "expired":
+        action.status = "expired"
+        action.error_code = "action_expired"
+        AuditService.record(
+            db,
+            principal,
+            "assistant_action_expired",
+            "assistant_action",
+            action.id,
+            after={"error_code": action.error_code},
+        )
+    return _result(action, error_code="action_expired")
+
+
+def _current_action_state(
+    db: Session, principal: Principal, action: AssistantAction
+) -> tuple[ActionDefinition | None, dict[str, Any] | None, str | None]:
+    """Revalidate mutable action constraints before confirmation or execution."""
+    definition = get_action(action.tool_name)
+    if definition is None or definition.risk_level != action.risk_level:
+        return None, None, "action_definition_changed"
+    if not principal.has_role(*definition.required_roles):
+        return definition, None, "permission_denied"
+    try:
+        validated_input = definition.input_model.model_validate(action.payload_json)
+        payload = _normalize_json(validated_input)
+    except (ValidationError, TypeError, ValueError):
+        return definition, None, "invalid_action_payload"
+
+    current_versions = _object_versions(db, definition, payload)
+    if current_versions != (action.object_versions_json or {}):
+        return definition, None, "object_version_changed"
+    expected_hash = _parameter_hash(definition.name, payload, principal.department_ids, current_versions)
+    if expected_hash != action.parameter_hash:
+        return definition, None, "parameter_hash_mismatch"
+    return definition, payload, None
+
+
+def confirm_action(
+    db: Session, principal: Principal, action_id: str, request: ActionConfirmRequest
+) -> ActionResult | ActionPreview:
+    """Reject confirmation requests whose saved request binding no longer matches."""
+    action = db.get(AssistantAction, action_id)
+    if action is None:
+        return ActionResult(action_id=action_id, status="failed", error_code="action_not_found")
+    if action.user_id != principal.user_id:
+        _record_rejection(db, principal, action, "owner_mismatch")
+        return _result(action, status_value="failed", error_code="owner_mismatch")
+    if action.status == "completed":
+        return _result(action)
+    if action.status in {"cancelled", "expired", "failed"}:
+        return _result(action)
+
+    valid, error_code = is_confirmation_valid(action, principal, request)
+    if not valid:
+        if error_code == "action_expired":
+            return _expire_action(db, principal, action)
+        _record_rejection(db, principal, action, error_code or "invalid_confirmation")
+        return _result(action, status_value="failed", error_code=error_code)
+
+    if action.status != "preview":
+        _record_rejection(db, principal, action, "confirmation_not_available")
+        return _result(action, status_value="failed", error_code="confirmation_not_available")
+
+    definition, _payload, state_error = _current_action_state(db, principal, action)
+    if state_error is not None:
+        _record_rejection(db, principal, action, state_error)
+        return _result(action, status_value="failed", error_code=state_error)
+    assert definition is not None
+    _phrase, requires_confirmation, steps_required = _CONFIRMATION_POLICY[definition.risk_level]
+    if not requires_confirmation:
+        _record_rejection(db, principal, action, "confirmation_not_required")
+        return _result(action, status_value="failed", error_code="confirmation_not_required")
+
+    current_step = int((action.preview_json or {}).get("confirmation_step", 0))
+    current_step += 1
+    action.preview_json = {**(action.preview_json or {}), "confirmation_step": current_step}
+    AuditService.record(
+        db,
+        principal,
+        "assistant_action_confirmed",
+        "assistant_action",
+        action.id,
+        after={"confirmation_step": current_step, "confirmation_steps_required": steps_required},
+    )
+    if current_step < steps_required:
+        return _preview_from_action(action, definition)
+
+    action.status = "confirmed"
+    action.confirmed_at = _now_utc()
+    return execute_action(db, principal, action.id, confirmation_phrase=request.confirmation_phrase)
+
+
+def cancel_action(db: Session, principal: Principal, action_id: str) -> ActionResult:
+    """Cancel a caller-owned nonterminal action without committing the transaction."""
+    action = db.get(AssistantAction, action_id)
+    if action is None:
+        return ActionResult(action_id=action_id, status="failed", error_code="action_not_found")
+    if action.user_id != principal.user_id:
+        _record_rejection(db, principal, action, "owner_mismatch")
+        return _result(action, status_value="failed", error_code="owner_mismatch")
+    if action.status == "cancelled":
+        return _result(action)
+    if action.status in {"completed", "failed", "expired"}:
+        return _result(action)
+
+    action.status = "cancelled"
+    action.error_code = None
+    AuditService.record(
+        db,
+        principal,
+        "assistant_action_cancelled",
+        "assistant_action",
+        action.id,
+    )
+    return _result(action)
+
+
+def _normalized_adapter_result(value: Any) -> dict[str, Any]:
+    normalized = _normalize_json(value)
+    return normalized if isinstance(normalized, dict) else {"value": normalized}
+
+
+def execute_action(
+    db: Session, principal: Principal, action_id: str, *, confirmation_phrase: str | None = None
+) -> ActionResult:
+    """Execute only an explicitly registered adapter after fresh fail-closed checks."""
+    action = db.get(AssistantAction, action_id)
+    if action is None:
+        return ActionResult(action_id=action_id, status="failed", error_code="action_not_found")
+    if action.user_id != principal.user_id:
+        _record_rejection(db, principal, action, "owner_mismatch")
+        return _result(action, status_value="failed", error_code="owner_mismatch")
+    if action.status == "completed":
+        return _result(action)
+    if action.status in {"cancelled", "expired", "failed"}:
+        return _result(action)
+    if _is_expired(action):
+        return _expire_action(db, principal, action)
+
+    definition, payload, state_error = _current_action_state(db, principal, action)
+    if state_error is not None:
+        _record_rejection(db, principal, action, state_error)
+        return _result(action, status_value="failed", error_code=state_error)
+    assert definition is not None and payload is not None
+
+    if definition.risk_level == "low":
+        if action.status != "preview":
+            return _result(action, status_value="failed", error_code="action_not_executable")
+    elif action.status != "confirmed":
+        _record_rejection(db, principal, action, "confirmation_required")
+        return _result(action, status_value="failed", error_code="confirmation_required")
+    if definition.risk_level != "low" and action.confirmation_phrase != confirmation_phrase:
+        _record_rejection(db, principal, action, "confirmation_phrase_mismatch")
+        return _result(action, status_value="failed", error_code="confirmation_phrase_mismatch")
+
+    adapter = _ACTION_ADAPTERS.get(action.tool_name)
+    if adapter is None:
+        action.status = "failed"
+        action.error_code = "unsupported_action"
+        AuditService.record(
+            db,
+            principal,
+            "assistant_action_failed",
+            "assistant_action",
+            action.id,
+            after={"error_code": action.error_code},
+        )
+        return _result(action)
+
+    action.status = "executing"
+    action.executed_at = _now_utc()
+    AuditService.record(db, principal, "assistant_action_execution_started", "assistant_action", action.id)
+    try:
+        action.result_json = _normalized_adapter_result(adapter(db, principal, payload))
+    except Exception:
+        action.status = "failed"
+        action.error_code = "execution_failed"
+        AuditService.record(
+            db,
+            principal,
+            "assistant_action_failed",
+            "assistant_action",
+            action.id,
+            after={"error_code": action.error_code},
+        )
+        return _result(action)
+
+    action.status = "completed"
+    action.error_code = None
+    AuditService.record(
+        db,
+        principal,
+        "assistant_action_completed",
+        "assistant_action",
+        action.id,
+        after={"result": action.result_json},
+    )
+    return _result(action)

@@ -10,9 +10,10 @@ from sqlalchemy.pool import StaticPool
 
 from app.db import Base
 from app.assistant.planner import ActionPlan
+import app.assistant.service as assistant_service
 from app.assistant import registry
 from app.assistant.registry import ActionDefinition, get_action
-from app.assistant.schemas import ActionChange, ActionPreview, ActionResult
+from app.assistant.schemas import ActionChange, ActionConfirmRequest, ActionPreview, ActionResult
 from app.assistant.service import create_preview
 from app.deps import Principal
 from app.models import AssistantAction, AuditLog, ExpenseClaim, Project
@@ -40,6 +41,16 @@ def _principal(*, role="admin", department_ids=("dept-a",)):
         role=role,
         department_id=department_ids[0] if department_ids else None,
         department_ids=department_ids,
+    )
+
+
+def _other_principal():
+    return Principal(
+        user_id="other-admin",
+        username="other-administrator",
+        role="admin",
+        department_id="dept-a",
+        department_ids=("dept-a",),
     )
 
 
@@ -265,3 +276,218 @@ def test_action_result_exposes_terminal_status_and_error():
     )
     assert result.status == "failed"
     assert result.error_code == "version_conflict"
+
+
+def test_confirm_action_rejects_wrong_parameter_hash_and_audits_it(db):
+    """Removing hash binding would allow one preview's approval to execute another request."""
+    preview = create_preview(
+        db,
+        _principal(),
+        "thread-1",
+        _plan("create_project", {"code": "KB-1", "name": "知识库"}),
+    )
+
+    result = assistant_service.confirm_action(
+        db,
+        _principal(),
+        preview.action_id,
+        ActionConfirmRequest(
+            action_id=preview.action_id,
+            confirmation_phrase="确认执行",
+            parameter_hash="wrong-hash",
+        ),
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "parameter_hash_mismatch"
+    assert db.get(AssistantAction, preview.action_id).status == "preview"
+    assert db.query(AuditLog).filter(AuditLog.action == "assistant_action_confirmation_rejected").count() == 1
+
+
+def _confirmation(preview, phrase=None, parameter_hash=None):
+    return ActionConfirmRequest(
+        action_id=preview.action_id,
+        confirmation_phrase=phrase if phrase is not None else preview.confirmation_phrase or "",
+        parameter_hash=parameter_hash if parameter_hash is not None else preview.parameter_hash or "",
+    )
+
+
+def test_confirm_action_rejects_wrong_owner_phrase_and_expired_preview_with_audit(db):
+    """Skipping any request binding check would let an unauthorized or stale preview execute."""
+    wrong_owner = create_preview(db, _principal(), "thread-1", _plan("create_project", {"code": "KB-1", "name": "知识库"}))
+    wrong_phrase = create_preview(db, _principal(), "thread-1", _plan("create_project", {"code": "KB-2", "name": "协作"}))
+    expired = create_preview(db, _principal(), "thread-1", _plan("create_project", {"code": "KB-3", "name": "过期"}))
+    db.get(AssistantAction, expired.action_id).expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+    owner_result = assistant_service.confirm_action(
+        db, _other_principal(), wrong_owner.action_id, _confirmation(wrong_owner)
+    )
+    phrase_result = assistant_service.confirm_action(
+        db, _principal(), wrong_phrase.action_id, _confirmation(wrong_phrase, phrase="错误确认")
+    )
+    expired_result = assistant_service.confirm_action(db, _principal(), expired.action_id, _confirmation(expired))
+
+    assert [owner_result.error_code, phrase_result.error_code, expired_result.error_code] == [
+        "owner_mismatch",
+        "confirmation_phrase_mismatch",
+        "action_expired",
+    ]
+    assert db.query(AuditLog).filter(AuditLog.action == "assistant_action_confirmation_rejected").count() == 2
+    assert db.query(AuditLog).filter(AuditLog.action == "assistant_action_expired").count() == 1
+
+
+def test_confirm_action_rechecks_current_permission_and_object_version(db, monkeypatch):
+    """Using preview-time authorization or versions would execute actions that are no longer valid."""
+    privileged = create_preview(db, _principal(), "thread-1", _plan("create_project", {"code": "KB-1", "name": "知识库"}))
+    definition = get_action("create_project")
+    assert definition is not None
+    monkeypatch.setitem(
+        registry._ACTION_BY_NAME,
+        "create_project",
+        ActionDefinition(
+            name=definition.name,
+            input_model=definition.input_model,
+            required_roles=("finance",),
+            risk_level=definition.risk_level,
+            preview=definition.preview,
+            execute=definition.execute,
+        ),
+    )
+
+    permission_result = assistant_service.confirm_action(db, _principal(), privileged.action_id, _confirmation(privileged))
+
+    expense = ExpenseClaim(id="expense-1", claim_no="EXP-001", requester_id="admin", title="差旅行程")
+    db.add(expense)
+    db.flush()
+    versioned = create_preview(
+        db,
+        _principal(),
+        "thread-1",
+        _plan(
+            "pay_expense",
+            {
+                "id": expense.id,
+                "payment_date": date(2026, 8, 31),
+                "method": "bank_transfer",
+                "idempotency_key": "payment-key-1",
+                "expected_version": 1,
+            },
+        ),
+    )
+    expense.version = 2
+    db.flush()
+    version_result = assistant_service.confirm_action(db, _principal(), versioned.action_id, _confirmation(versioned))
+
+    assert permission_result.error_code == "permission_denied"
+    assert version_result.error_code == "object_version_changed"
+    assert db.query(AuditLog).filter(AuditLog.action == "assistant_action_confirmation_rejected").count() == 2
+
+
+def test_confirm_action_executes_high_once_and_batch_on_second_confirmation(db, monkeypatch):
+    """Changing confirmation count or bypassing the adapter would execute the wrong number of times."""
+    calls = []
+
+    def adapter(db, principal, payload):
+        calls.append((principal.user_id, payload))
+        return {"call_count": len(calls)}
+
+    monkeypatch.setattr(assistant_service, "_ACTION_ADAPTERS", {}, raising=False)
+    assistant_service.register_action_adapter("create_project", adapter)
+    assistant_service.register_action_adapter("generate_payroll", adapter)
+    high = create_preview(db, _principal(), "thread-1", _plan("create_project", {"code": "KB-1", "name": "知识库"}))
+    batch = create_preview(db, _principal(), "thread-1", _plan("generate_payroll", {}))
+
+    high_result = assistant_service.confirm_action(db, _principal(), high.action_id, _confirmation(high))
+    first_batch_confirmation = assistant_service.confirm_action(db, _principal(), batch.action_id, _confirmation(batch))
+    batch_result = assistant_service.confirm_action(db, _principal(), batch.action_id, _confirmation(batch))
+
+    assert high_result.status == "completed"
+    assert isinstance(first_batch_confirmation, ActionPreview)
+    assert first_batch_confirmation.confirmation_step == 1
+    assert batch_result.status == "completed"
+    assert len(calls) == 2
+    assert db.query(AuditLog).filter(AuditLog.action == "assistant_action_confirmed").count() == 3
+
+
+def test_cancel_action_is_owner_only_and_idempotent(db):
+    """Allowing another user to cancel or auditing every repeat would break action ownership and idempotency."""
+    preview = create_preview(db, _principal(), "thread-1", _plan("create_project", {"code": "KB-1", "name": "知识库"}))
+
+    wrong_user = assistant_service.cancel_action(db, _other_principal(), preview.action_id)
+    first_cancel = assistant_service.cancel_action(db, _principal(), preview.action_id)
+    second_cancel = assistant_service.cancel_action(db, _principal(), preview.action_id)
+
+    assert wrong_user.error_code == "owner_mismatch"
+    assert first_cancel.status == "cancelled"
+    assert second_cancel.status == "cancelled"
+    assert db.query(AuditLog).filter(AuditLog.action == "assistant_action_cancelled").count() == 1
+
+
+def test_execute_action_fails_closed_without_adapter_and_uses_counting_adapter_once(db, monkeypatch):
+    """Calling registry.execute or re-running a terminal action would bypass the explicit fail-closed boundary."""
+    missing = create_preview(db, _principal(), "thread-1", _plan("create_project", {"code": "KB-1", "name": "知识库"}))
+    missing_result = assistant_service.confirm_action(db, _principal(), missing.action_id, _confirmation(missing))
+
+    calls = []
+
+    def adapter(db, principal, payload):
+        calls.append(payload)
+        return {"created": payload["code"]}
+
+    monkeypatch.setattr(assistant_service, "_ACTION_ADAPTERS", {}, raising=False)
+    assistant_service.register_action_adapter("create_project", adapter)
+    completed = create_preview(db, _principal(), "thread-1", _plan("create_project", {"code": "KB-2", "name": "协作"}))
+    completed_result = assistant_service.confirm_action(db, _principal(), completed.action_id, _confirmation(completed))
+    repeat_result = assistant_service.execute_action(db, _principal(), completed.action_id)
+
+    assert missing_result.status == "failed"
+    assert missing_result.error_code == "unsupported_action"
+    assert completed_result.result == {"created": "KB-2"}
+    assert repeat_result == completed_result
+    assert len(calls) == 1
+    assert db.query(AuditLog).filter(AuditLog.action == "assistant_action_failed").count() == 1
+
+
+def test_low_risk_action_executes_without_confirmation(db, monkeypatch):
+    """Requiring confirmation for low-risk reads would violate the configured lifecycle."""
+    monkeypatch.setattr(assistant_service, "_ACTION_ADAPTERS", {}, raising=False)
+    assistant_service.register_action_adapter("list_projects", lambda db, principal, payload: {"items": []})
+    preview = create_preview(db, _principal(), "thread-1", _plan("list_projects", {}))
+
+    result = assistant_service.execute_action(db, _principal(), preview.action_id)
+
+    assert result.status == "completed"
+    assert result.result == {"items": []}
+
+
+def test_execute_action_rechecks_high_risk_confirmation_phrase(db, monkeypatch):
+    """Allowing a direct confirmed execution without the phrase would bypass the final confirmation check."""
+    calls = []
+    monkeypatch.setattr(assistant_service, "_ACTION_ADAPTERS", {}, raising=False)
+    assistant_service.register_action_adapter(
+        "create_project", lambda db, principal, payload: calls.append(payload) or {"created": payload["code"]}
+    )
+    preview = create_preview(db, _principal(), "thread-1", _plan("create_project", {"code": "KB-1", "name": "知识库"}))
+    action = db.get(AssistantAction, preview.action_id)
+    action.status = "confirmed"
+
+    rejected = assistant_service.execute_action(db, _principal(), preview.action_id)
+    completed = assistant_service.execute_action(
+        db, _principal(), preview.action_id, confirmation_phrase=preview.confirmation_phrase
+    )
+
+    assert rejected.error_code == "confirmation_phrase_mismatch"
+    assert completed.status == "completed"
+    assert len(calls) == 1
+
+
+def test_is_confirmation_valid_rejects_non_preview_status(db):
+    """Treating a terminal action as confirmable would reopen a completed or cancelled lifecycle."""
+    preview = create_preview(db, _principal(), "thread-1", _plan("create_project", {"code": "KB-1", "name": "知识库"}))
+    action = db.get(AssistantAction, preview.action_id)
+    action.status = "cancelled"
+
+    valid, error_code = assistant_service.is_confirmation_valid(action, _principal(), _confirmation(preview))
+
+    assert valid is False
+    assert error_code == "confirmation_not_available"
