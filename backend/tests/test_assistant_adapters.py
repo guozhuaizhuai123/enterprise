@@ -1,0 +1,198 @@
+import json
+
+import pytest
+from fastapi import HTTPException
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app.assistant.registry import get_action
+import app.assistant.service as assistant_service
+from app.db import Base
+from app.deps import Principal
+from app.models import (
+    ApprovalInstance,
+    Department,
+    EmployeeProfile,
+    ExpenseClaim,
+    Project,
+    Ticket,
+    User,
+    UserDepartment,
+    WorkflowDefinition,
+)
+
+
+@pytest.fixture
+def db():
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    try:
+        yield session
+    finally:
+        session.close()
+        Base.metadata.drop_all(engine)
+        engine.dispose()
+
+
+def _principal(*, user_id: str, role: str = "admin", department_ids: tuple[str, ...] = ()) -> Principal:
+    return Principal(
+        user_id=user_id,
+        username=user_id,
+        role=role,
+        department_id=department_ids[0] if department_ids else None,
+        department_ids=department_ids,
+    )
+
+
+def _payload(name: str, **values):
+    action = get_action(name)
+    assert action is not None
+    return action.input_model.model_validate(values).model_dump(mode="python")
+
+
+def _adapter(name: str):
+    return assistant_service._ACTION_ADAPTERS[name]
+
+
+def test_installation_registers_only_the_seven_production_read_actions(monkeypatch):
+    """Adding a write adapter or omitting a read adapter would widen or break the approved catalog."""
+    from app.assistant.adapters import install_production_adapters
+
+    monkeypatch.setattr(assistant_service, "_ACTION_ADAPTERS", {})
+
+    install_production_adapters()
+    install_production_adapters()
+
+    assert set(assistant_service._ACTION_ADAPTERS) == {
+        "search_knowledge",
+        "list_departments",
+        "list_projects",
+        "list_contracts",
+        "list_expenses",
+        "list_approvals",
+        "list_tickets",
+    }
+
+
+def test_root_without_memberships_searches_every_department_and_returns_safe_chunks(db, monkeypatch):
+    """Replacing root scope with memberships would silently hide other departments' knowledge."""
+    from app.assistant import adapters
+
+    db.add_all([
+        Department(id="dept-a", name="研发", code="RND"),
+        Department(id="dept-b", name="财务", code="FIN"),
+    ])
+    db.flush()
+    captured: dict[str, object] = {}
+
+    def fake_search(_db, *, department_ids, query, top_k, document_ids=None):
+        captured.update(department_ids=tuple(department_ids), query=query, top_k=top_k)
+        return [
+            adapters.RetrievedChunk(
+                chunk_id="chunk-1",
+                document_id="doc-1",
+                text="研发制度摘要",
+                bm25_score=0.2,
+                cosine_score=0.7,
+                combined_score=0.5,
+            )
+        ]
+
+    monkeypatch.setattr(adapters.retriever, "search_departments", fake_search)
+    adapters.install_production_adapters()
+
+    result = _adapter("search_knowledge")(db, _principal(user_id="root"), _payload("search_knowledge", query=" 制度 "))
+
+    assert captured == {"department_ids": ("dept-a", "dept-b"), "query": "制度", "top_k": 8}
+    assert result == {
+        "items": [{
+            "document_id": "doc-1",
+            "document_title": "",
+            "chunk_id": "chunk-1",
+            "excerpt": "研发制度摘要",
+            "score": 0.5,
+        }],
+        "count": 1,
+    }
+    json.dumps(result)
+
+
+def test_non_root_cannot_filter_read_actions_to_another_department(db):
+    """Dropping the requested-scope check would let a manager enumerate another department's projects."""
+    from app.assistant.adapters import install_production_adapters
+
+    db.add_all([
+        Department(id="dept-a", name="研发", code="RND"),
+        Department(id="dept-b", name="财务", code="FIN"),
+    ])
+    db.flush()
+    install_production_adapters()
+
+    with pytest.raises(HTTPException) as exc_info:
+        _adapter("list_projects")(
+            db,
+            _principal(user_id="manager", role="manager", department_ids=("dept-a",)),
+            _payload("list_projects", department_id="dept-b"),
+        )
+
+    assert exc_info.value.status_code == 403
+
+
+def test_expense_ticket_and_approval_adapters_keep_existing_visibility_boundaries(db):
+    """Removing any established visibility predicate would leak a peer's financial, ticket, or approval record."""
+    from app.assistant.adapters import install_production_adapters
+
+    db.add_all([
+        Department(id="dept-a", name="研发", code="RND"),
+        Department(id="dept-b", name="财务", code="FIN"),
+        User(id="viewer", username="viewer", password_encrypted="secret", role="manager", department_id="dept-a"),
+        User(id="employee", username="employee", password_encrypted="secret", role="employee", department_id="dept-a"),
+        User(id="outsider", username="outsider", password_encrypted="secret", role="employee", department_id="dept-b"),
+        UserDepartment(user_id="viewer", department_id="dept-a", is_primary=True),
+        EmployeeProfile(user_id="employee", full_name="Employee", manager_id="viewer"),
+        EmployeeProfile(user_id="outsider", full_name="Outsider"),
+        ExpenseClaim(id="expense-visible", claim_no="EXP-1", requester_id="employee", department_id="dept-a", title="可见费用"),
+        ExpenseClaim(id="expense-hidden", claim_no="EXP-2", requester_id="outsider", department_id="dept-b", title="隐藏费用"),
+        Ticket(id="ticket-visible", requester_id="employee", department_id="dept-a", ticket_type="issue", subject="可见工单", description="visible", status="in_progress"),
+        Ticket(id="ticket-hidden", requester_id="outsider", department_id="dept-b", ticket_type="issue", subject="隐藏工单", description="hidden", status="in_progress"),
+        WorkflowDefinition(id="flow-1", code="flow-1", name="审批流", version=1, active=True),
+        ApprovalInstance(id="approval-visible", definition_id="flow-1", entity_type="expense_claim", entity_id="expense-visible", requester_id="viewer"),
+        ApprovalInstance(id="approval-hidden", definition_id="flow-1", entity_type="expense_claim", entity_id="expense-hidden", requester_id="outsider"),
+    ])
+    db.flush()
+    install_production_adapters()
+    principal = _principal(user_id="viewer", role="manager", department_ids=("dept-a",))
+
+    expenses = _adapter("list_expenses")(db, principal, _payload("list_expenses"))
+    tickets = _adapter("list_tickets")(db, principal, _payload("list_tickets"))
+    approvals = _adapter("list_approvals")(db, principal, _payload("list_approvals"))
+
+    assert [item["id"] for item in expenses["items"]] == ["expense-visible"]
+    assert [item["id"] for item in tickets["items"]] == ["ticket-visible"]
+    assert [item["id"] for item in approvals["items"]] == ["approval-visible"]
+
+
+def test_project_results_are_bounded_json_only_and_do_not_serialize_secret_fields(db):
+    """Removing the output projection or limit could return an unbounded ORM object graph to the assistant."""
+    from app.assistant.adapters import install_production_adapters
+
+    db.add(Department(id="dept-a", name="研发", code="RND"))
+    db.add_all(
+        [
+            Project(id=f"project-{index:02d}", code=f"P-{index:02d}", name=f"项目 {index:02d}", department_id="dept-a")
+            for index in range(51)
+        ]
+    )
+    db.flush()
+    install_production_adapters()
+
+    result = _adapter("list_projects")(db, _principal(user_id="root"), _payload("list_projects"))
+
+    assert result["count"] == 50
+    assert len(result["items"]) == 50
+    assert {"password", "password_encrypted", "token", "content", "salary"}.isdisjoint(result["items"][0])
+    json.dumps(result)
