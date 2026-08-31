@@ -449,6 +449,7 @@ def _update_org(s,p,x):
     if row is None: raise HTTPException(404,"organization unit not found")
     OrganizationService.update_org_unit(s,row,_schema("OrgUnitUpdate",{k:v for k,v in x.items() if k!="id"})); return {"id":row.id,"name":row.name,"code":row.code}
 def _create_project(s,p,x):
+    if s.query(Project).filter(Project.code == x["code"].strip()).first(): raise HTTPException(409,"project code already exists")
     row=Project(created_by=p.user_id,**x); s.add(row); s.flush(); return {"id":row.id,"code":row.code,"name":row.name,"status":row.status}
 def _update_project(s,p,x):
     row=s.get(Project,x["id"])
@@ -461,6 +462,8 @@ def _delete_project(s,p,x):
     if row is None: raise HTTPException(404,"project not found")
     s.query(Contract).filter(Contract.project_id==row.id).update({Contract.project_id:None},synchronize_session=False); s.query(Document).filter(Document.project_id==row.id).update({Document.project_id:None},synchronize_session=False); s.delete(row); s.flush(); return {"id":x["id"],"deleted":True}
 def _create_contract(s,p,x):
+    if s.query(Contract).filter(Contract.code == x["code"].strip()).first(): raise HTTPException(409,"contract code already exists")
+    if x.get("project_id") and s.get(Project,x["project_id"]) is None: raise HTTPException(400,"project not found")
     row=Contract(created_by=p.user_id,**x); s.add(row); s.flush(); return {"id":row.id,"code":row.code,"name":row.name,"status":row.status}
 def _update_contract(s,p,x):
     row=s.get(Contract,x["id"])
@@ -474,6 +477,11 @@ def _delete_contract(s,p,x):
     s.query(Document).filter(Document.contract_id==row.id).update({Document.contract_id:None},synchronize_session=False); s.delete(row); s.flush(); return {"id":x["id"],"deleted":True}
 def _create_document(s,p,x):
     if s.get(Department,x["department_id"]) is None: raise HTTPException(404,"department not found")
+    if x.get("project_id") and s.get(Project,x["project_id"]) is None: raise HTTPException(400,"project not found")
+    if x.get("contract_id"):
+        contract=s.get(Contract,x["contract_id"])
+        if contract is None: raise HTTPException(400,"contract not found")
+        if contract.project_id and x.get("project_id") and contract.project_id != x["project_id"]: raise HTTPException(400,"contract belongs to another project")
     data={k:v for k,v in x.items() if k!="department_id"}; row=Document(department_id=x["department_id"],uploaded_by=p.user_id,owner_id=p.user_id,owner_name=p.username,**data); s.add(row); s.flush(); _index_document(s,row); return {"id":row.id,"title":row.title,"department_id":row.department_id}
 def _update_document(s,p,x):
     row=s.get(Document,x["id"])

@@ -402,6 +402,8 @@ def create_document(
         project_id=project_id,
         contract_id=contract_id,
     )
+    db.commit()
+    db.refresh(doc)
     return _document_out(doc, detail=True)
 
 
@@ -450,3 +452,4 @@ def update_document(document_id: str, payload: DocumentUpdate, db: Session = Dep
 def delete_document(document_id: str, db: Session = Depends(get_db)):
     doc = _document_or_404(db, document_id)
     kb_service.delete_document(db, doc)
+    db.commit()

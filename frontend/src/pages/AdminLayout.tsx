@@ -106,8 +106,8 @@ export default function AdminLayout() {
 
   const groups: NavGroup[] = [
     {
-      label: "工作台",
-      items: [{ to: "/admin/dashboard", label: "管理驾驶舱" }],
+      label: "核心入口",
+      items: [{ to: "/admin/assistant", label: "管理助手" }, { to: "/admin/overview", label: "企业全景" }],
     },
     {
       label: "组织人事",
