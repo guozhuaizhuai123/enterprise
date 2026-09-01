@@ -23,6 +23,7 @@ from app.assistant.schemas import ActionConfirmRequest, ActionPreview, ActionRes
 from app.audit.service import AuditService
 from app.deps import Principal
 from app.models import AssistantAction
+from app.security import decrypt_password, encrypt_password
 
 
 _PREVIEW_TTL = timedelta(minutes=5)
@@ -34,6 +35,7 @@ _CONFIRMATION_POLICY: dict[str, tuple[str | None, bool, int]] = {
 }
 ActionAdapter = Callable[[Session, Principal, dict[str, Any]], Any]
 _ACTION_ADAPTERS: dict[str, ActionAdapter] = {}
+_SECRET_CIPHERTEXT_KEY = "ciphertext"
 
 
 def _normalize_json(value: Any) -> Any:
@@ -60,6 +62,31 @@ def _normalize_json(value: Any) -> Any:
     raise TypeError(f"unsupported preview payload value: {type(value)!r}")
 
 
+def _seal_secret_fields(definition: ActionDefinition, payload: dict[str, Any]) -> dict[str, Any]:
+    """Encrypt registered one-time secret inputs before the action is persisted."""
+    stored = dict(payload)
+    for field_name in definition.secret_fields:
+        value = stored.get(field_name)
+        if not isinstance(value, str):
+            raise ValueError("secret action payload is invalid")
+        stored[field_name] = {_SECRET_CIPHERTEXT_KEY: encrypt_password(value)}
+    return stored
+
+
+def _open_secret_fields(definition: ActionDefinition, payload: dict[str, Any]) -> dict[str, Any]:
+    """Decrypt only at server-side revalidation/execution time; never return secrets."""
+    executable = dict(payload)
+    for field_name in definition.secret_fields:
+        sealed = executable.get(field_name)
+        if not isinstance(sealed, dict) or set(sealed) != {_SECRET_CIPHERTEXT_KEY}:
+            raise ValueError("secret action payload is invalid")
+        token = sealed[_SECRET_CIPHERTEXT_KEY]
+        if not isinstance(token, str):
+            raise ValueError("secret action payload is invalid")
+        executable[field_name] = decrypt_password(token)
+    return executable
+
+
 def _row_snapshot(row: Any) -> str:
     """Hash every persisted scalar target attribute for models without a revision field."""
     material = {column.name: _normalize_json(getattr(row, column.name)) for column in row.__table__.columns}
@@ -84,6 +111,8 @@ def _object_versions(
         ).scalar_one_or_none()
     else:
         row = db.get(model, object_id)
+    if row is None and definition.allow_missing_target:
+        return {object_id: "missing"}
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "assistant action target was not found")
     version = getattr(row, "version", None) if row is not None else None
@@ -131,7 +160,10 @@ def create_preview(db: Session, principal: Principal, thread_id: str | None, pla
         validated_input.model_dump(mode="python", exclude_unset=definition.target_model is not None)
     )
     object_versions = _object_versions(db, definition, payload)
-    parameter_hash = _parameter_hash(definition.name, payload, principal.department_ids, object_versions)
+    stored_payload = _seal_secret_fields(definition, payload)
+    parameter_hash = _parameter_hash(
+        definition.name, stored_payload, principal.department_ids, object_versions
+    )
     confirmation_phrase, requires_confirmation, confirmation_steps_required = _CONFIRMATION_POLICY[
         definition.risk_level
     ]
@@ -143,7 +175,7 @@ def create_preview(db: Session, principal: Principal, thread_id: str | None, pla
         tool_name=definition.name,
         risk_level=definition.risk_level,
         status="preview",
-        payload_json=payload,
+        payload_json=stored_payload,
         parameter_hash=parameter_hash,
         object_versions_json=object_versions,
         confirmation_phrase=confirmation_phrase,
@@ -176,7 +208,7 @@ def create_preview(db: Session, principal: Principal, thread_id: str | None, pla
         after={
             "tool_name": definition.name,
             "risk_level": definition.risk_level,
-            "payload": payload,
+            "payload": stored_payload,
             "parameter_hash": parameter_hash,
             "object_versions": object_versions,
             "confirmation_phrase": confirmation_phrase,
@@ -309,6 +341,23 @@ def _record_rejection(db: Session, principal: Principal, action: AssistantAction
     )
 
 
+def _invalidate_unreadable_secret(
+    db: Session, principal: Principal, action: AssistantAction
+) -> ActionResult:
+    """A preview encrypted under an unavailable key can never safely be retried."""
+    action.status = "failed"
+    action.error_code = "secret_unavailable"
+    AuditService.record(
+        db,
+        principal,
+        "assistant_action_failed",
+        "assistant_action",
+        action.id,
+        after={"error_code": action.error_code},
+    )
+    return _result(action)
+
+
 def _expire_action(db: Session, principal: Principal, action: AssistantAction) -> ActionResult:
     if action.status in {"preview", "confirmed"} and _conditional_transition(
         db,
@@ -338,8 +387,13 @@ def _current_action_state(
         return None, None, "action_definition_changed"
     if not principal.has_role(*definition.required_roles):
         return definition, None, "permission_denied"
+    stored_payload = _normalize_json(action.payload_json)
     try:
-        validated_input = definition.input_model.model_validate(action.payload_json)
+        executable_payload = _open_secret_fields(definition, stored_payload)
+    except (TypeError, ValueError):
+        return definition, None, "secret_unavailable"
+    try:
+        validated_input = definition.input_model.model_validate(executable_payload)
         payload = _normalize_json(validated_input)
     except (ValidationError, TypeError, ValueError):
         return definition, None, "invalid_action_payload"
@@ -350,7 +404,9 @@ def _current_action_state(
         return definition, None, "object_version_changed"
     if current_versions != (action.object_versions_json or {}):
         return definition, None, "object_version_changed"
-    expected_hash = _parameter_hash(definition.name, payload, principal.department_ids, current_versions)
+    expected_hash = _parameter_hash(
+        definition.name, stored_payload, principal.department_ids, current_versions
+    )
     if expected_hash != action.parameter_hash:
         return definition, None, "parameter_hash_mismatch"
     return definition, payload, None
@@ -380,6 +436,8 @@ def confirm_action(
 
     definition, _payload, state_error = _current_action_state(db, principal, action)
     if state_error is not None:
+        if state_error == "secret_unavailable":
+            return _invalidate_unreadable_secret(db, principal, action)
         _record_rejection(db, principal, action, state_error)
         return _result(action, status_value="failed", error_code=state_error)
     assert definition is not None
@@ -474,6 +532,20 @@ class _AdapterSession:
         return getattr(self._db, name)
 
 
+def execute_low_risk_query(db: Session, principal: Principal, plan: ActionPlan) -> dict[str, Any]:
+    """Execute an authorized low-risk read without persisting a preview row."""
+    definition = _registered_definition(plan)
+    if definition.risk_level != "low":
+        raise HTTPException(status.HTTP_409_CONFLICT, "query requires preview")
+    if not principal.has_role(*definition.required_roles):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "principal is not authorized for this action")
+    adapter = _ACTION_ADAPTERS.get(definition.name)
+    if adapter is None:
+        raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, "assistant query is unsupported")
+    payload = _normalize_json(plan.input.model_dump(mode="python"))
+    return _normalized_adapter_result(adapter(_AdapterSession(db), principal, payload))
+
+
 def execute_action(
     db: Session, principal: Principal, action_id: str, *, confirmation_phrase: str | None = None
 ) -> ActionResult:
@@ -493,6 +565,8 @@ def execute_action(
 
     definition, payload, state_error = _current_action_state(db, principal, action)
     if state_error is not None:
+        if state_error == "secret_unavailable":
+            return _invalidate_unreadable_secret(db, principal, action)
         _record_rejection(db, principal, action, state_error)
         return _result(action, status_value="failed", error_code=state_error)
     assert definition is not None and payload is not None
@@ -518,7 +592,7 @@ def execute_action(
     ):
         return _result(action)
 
-    _post_definition, _post_payload, post_claim_error = _current_action_state(
+    _post_definition, post_payload, post_claim_error = _current_action_state(
         db, principal, action, lock_target=True
     )
     if post_claim_error is not None:
@@ -551,7 +625,10 @@ def execute_action(
     AuditService.record(db, principal, "assistant_action_execution_started", "assistant_action", action.id)
     try:
         with db.begin_nested():
-            action.result_json = _normalized_adapter_result(adapter(_AdapterSession(db), principal, payload))
+            assert post_payload is not None
+            action.result_json = _normalized_adapter_result(
+                adapter(_AdapterSession(db), principal, post_payload)
+            )
     except Exception:
         action.status = "failed"
         action.error_code = "execution_failed"

@@ -39,7 +39,7 @@ class Settings(BaseSettings):
 
     # Bootstrap admin (created on first startup if no admin exists)
     bootstrap_admin_username: str = "admin"
-    bootstrap_admin_password: str = "replace-with-a-strong-password"
+    bootstrap_admin_password: str = "admin123"
 
     def require_runtime_secrets(self) -> None:
         """Reject development defaults when the service is marked production."""

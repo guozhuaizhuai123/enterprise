@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -440,7 +441,7 @@ class ChatAskPreparationTest(unittest.TestCase):
         Base.metadata.drop_all(self.engine)
         self.engine.dispose()
 
-    def _client(self, user_id="user-1", department_ids=("dept-1",)):
+    def _client(self, user_id="user-1", department_ids=("dept-1",), role="employee"):
         app = FastAPI()
         app.include_router(chat.router)
 
@@ -452,14 +453,46 @@ class ChatAskPreparationTest(unittest.TestCase):
             return Principal(
                 user_id=user_id,
                 username=user_id,
-                role="employee",
-                department_id=department_ids[0],
+                role=role,
+                department_id=department_ids[0] if department_ids else None,
                 department_ids=department_ids,
+                roles=(role,),
             )
 
         app.dependency_overrides[get_db] = override_db
         app.dependency_overrides[get_current_principal] = override_principal
         return TestClient(app)
+
+    def test_low_risk_natural_language_query_executes_and_returns_result_event(self):
+        """Leaving a low-risk action at preview would make the management assistant show no answer."""
+        from app.assistant.adapters import install_production_adapters
+        from app.models import Project
+        from sse_starlette.sse import AppStatus
+
+        AppStatus.should_exit_event = None
+        with self.session_factory() as db:
+            db.add(Department(id="dept-1", name="研发", code="RND"))
+            db.add(Project(id="project-1", code="P-1", name="知识库项目", department_id="dept-1"))
+            db.commit()
+        install_production_adapters()
+
+        with patch.object(chat, "SessionLocal", self.session_factory), patch.object(
+            chat, "run_ask", side_effect=AssertionError("management query must not call document RAG")
+        ):
+            with self._client(user_id="root", department_ids=(), role="admin") as client:
+                response = client.post("/chat/ask", json={"question": "查询一下最近的项目"})
+
+        self.assertEqual(response.status_code, 200)
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        result_event = next(event for event in events if event["node"] == "query_result")
+        self.assertEqual(result_event["status"], "completed")
+        self.assertEqual(result_event["tool_name"], "list_projects")
+        self.assertEqual(result_event["result"]["items"][0]["name"], "知识库项目")
+        self.assertFalse(any(event["node"] == "action_preview" for event in events))
 
     def _document(self, document_id, department_id="dept-1"):
         with self.session_factory() as db:

@@ -17,6 +17,7 @@ from app.schemas import (
     EmploymentEventCreate,
     OrgUnitCreate,
     OrgUnitUpdate,
+    PasswordResetIn,
 )
 from app.security import hash_password
 from app.audit.service import AuditService
@@ -325,3 +326,9 @@ class OrganizationService:
         db.add(event)
         db.flush()
         return event
+
+    @staticmethod
+    def reset_employee_password(db: Session, user: User, payload: PasswordResetIn) -> None:
+        """Apply a validated password reset without owning the surrounding transaction."""
+        user.password_encrypted = hash_password(payload.password)
+        db.flush()

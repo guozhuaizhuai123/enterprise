@@ -18,7 +18,6 @@ from app.schemas import (
     OrgUnitUpdate,
     PasswordResetIn,
 )
-from app.security import hash_password
 
 
 admin_router = APIRouter(prefix="/admin", tags=["organization"])
@@ -237,7 +236,7 @@ def reset_employee_password(
     user = db.get(User, employee_id)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "employee not found")
-    user.password_encrypted = hash_password(payload.password)
+    OrganizationService.reset_employee_password(db, user, payload)
     db.commit()
 
 

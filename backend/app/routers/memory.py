@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.db import get_db
 from app.deps import Principal, get_current_principal, require_admin
+from app.governance.service import GovernanceService
 from app.models import Department, DepartmentMemory, UserChatSetting, UserMemory
 from app.schemas import (
     DepartmentMemoryOut,
@@ -156,24 +157,9 @@ def create_department_memory(
     db: Session = Depends(get_db),
     principal: Principal = Depends(require_admin),
 ):
-    _department_or_404(db, department_id)
-    title, content = _trim_memory_values(payload.title, payload.content)
-    if (
-        db.query(DepartmentMemory)
-        .filter(DepartmentMemory.department_id == department_id)
-        .count()
-        >= get_settings().department_memory_limit
-    ):
-        raise HTTPException(status.HTTP_409_CONFLICT, "department memory limit reached")
-    memory = DepartmentMemory(
-        department_id=department_id,
-        title=title,
-        content=content,
-        enabled=payload.enabled,
-        created_by=principal.user_id,
-        updated_by=principal.user_id,
+    memory = GovernanceService.create_department_memory(
+        db, department_id, payload, principal, settings=get_settings()
     )
-    db.add(memory)
     db.commit()
     db.refresh(memory)
     return memory
@@ -189,23 +175,20 @@ def update_department_memory(
     memory = db.get(DepartmentMemory, memory_id)
     if memory is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "department memory not found")
-    title, content = _trim_memory_values(payload.title, payload.content)
-    if title is not None:
-        memory.title = title
-    if content is not None:
-        memory.content = content
-    if payload.enabled is not None:
-        memory.enabled = payload.enabled
-    memory.updated_by = principal.user_id
+    GovernanceService.update_department_memory(db, memory, payload, principal)
     db.commit()
     db.refresh(memory)
     return memory
 
 
 @admin_memory_router.delete("/department-memories/{memory_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_department_memory(memory_id: str, db: Session = Depends(get_db)):
+def delete_department_memory(
+    memory_id: str,
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(require_admin),
+):
     memory = db.get(DepartmentMemory, memory_id)
     if memory is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "department memory not found")
-    db.delete(memory)
+    GovernanceService.delete_department_memory(db, memory, principal)
     db.commit()

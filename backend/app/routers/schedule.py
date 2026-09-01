@@ -30,11 +30,11 @@ from app.schedule.service import (
     delete_holiday,
     get_schedule,
     list_applicable_holidays,
-    preview_leave,
     replace_schedule,
     review_leave_request,
     upsert_attendance,
 )
+from app.assistant.form_previews import preview_form
 from app.schemas import (
     AttendanceHistoryOut,
     AttendanceRecordOut,
@@ -251,7 +251,7 @@ def leave_preview(
     principal: Principal = Depends(get_current_principal),
 ):
     del principal
-    return preview_leave(payload.text, payload.today or date.today())
+    return LeavePreviewOut.model_validate(preview_form("leave", payload.text, payload.today or date.today()))
 
 
 @me_router.post(

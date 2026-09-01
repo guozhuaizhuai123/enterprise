@@ -3,6 +3,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.assistant.periods import business_today
 from app.assistant.planner import ActionPlan, ClarificationPlan, plan_input
 from app.db import Base
 from app.assistant.registry import get_action, list_actions
@@ -115,7 +116,19 @@ def test_payroll_generation_plan_rejects_finance_without_admin_role(finance_prin
     ("text", "action_name", "expected_input"),
     [
         ("查询项目", "list_projects", {"department_id": None, "query": None}),
+        ("查询一下最近的项目", "list_projects", {"department_id": None, "query": None}),
         ("查询部门", "list_departments", {"department_id": None, "query": None}),
+        (
+            "查看一下今天考勤",
+            "attendance_summary",
+            {
+                "department_id": None,
+                "attendance_date": business_today(),
+                "month": None,
+                "start_date": None,
+                "end_date": None,
+            },
+        ),
         (
             "创建组织部门：研发，编码：RND",
             "create_org_unit",

@@ -1,4 +1,6 @@
 import json
+from datetime import UTC, date, datetime
+from decimal import Decimal
 
 import pytest
 from fastapi import HTTPException
@@ -6,13 +8,15 @@ from sqlalchemy import event, create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.assistant.registry import get_action
+from app.assistant.registry import get_action, list_actions
 import app.assistant.service as assistant_service
 from app.db import Base
 from app.deps import Principal
 from app.models import (
     ApprovalInstance,
     ApprovalTask,
+    AttendanceRecord,
+    Contract,
     Department,
     EmployeeProfile,
     ExpenseClaim,
@@ -70,26 +74,348 @@ def test_installation_registers_the_approved_read_and_write_actions(monkeypatch)
     install_production_adapters()
     install_production_adapters()
 
-    assert set(assistant_service._ACTION_ADAPTERS) == {
-        "search_knowledge",
-        "list_departments",
-        "list_projects",
-        "list_contracts",
-        "list_expenses",
-        "list_approvals",
-        "list_tickets",
-        "create_org_unit",
-        "update_org_unit",
-        "create_project",
-        "update_project",
-        "delete_project",
-        "create_contract",
-        "update_contract",
-        "delete_contract",
-        "create_document",
-        "update_document",
-        "delete_document",
-        "create_expense_draft", "update_expense_draft", "delete_expense_draft", "create_leave_request", "create_ticket", "delete_ticket", "approve_approval", "reject_approval", "cancel_approval", "pay_expense", "generate_payroll",
+    assert set(assistant_service._ACTION_ADAPTERS) == {action.name for action in list_actions()}
+
+
+def test_attendance_summary_returns_live_aggregate_without_employee_names(db):
+    """Removing the live attendance adapter would send an operational query through document RAG."""
+    from app.assistant.adapters import install_production_adapters
+
+    today = date.today()
+    db.add(Department(id="dept-a", name="研发", code="RND"))
+    db.add_all([
+        User(id="employee-a", username="alice", password_encrypted="secret", role="employee", department_id="dept-a"),
+        User(id="employee-b", username="bob", password_encrypted="secret", role="employee", department_id="dept-a"),
+        UserDepartment(user_id="employee-a", department_id="dept-a", is_primary=True),
+        UserDepartment(user_id="employee-b", department_id="dept-a", is_primary=True),
+        EmployeeProfile(user_id="employee-a", full_name="Alice", status="active"),
+        EmployeeProfile(user_id="employee-b", full_name="Bob", status="probation"),
+        AttendanceRecord(user_id="employee-a", attendance_date=today, status="present", recorded_by="root"),
+    ])
+    db.flush()
+    install_production_adapters()
+
+    result = _adapter("attendance_summary")(
+        db,
+        _principal(user_id="root"),
+        _payload("attendance_summary"),
+    )
+
+    assert result == {
+        "date": today.isoformat(),
+        "active_employees": 2,
+        "recorded": 1,
+        "missing": 1,
+        "status_counts": {"present": 1, "late": 0, "absent": 0, "remote": 0},
+    }
+    assert "items" not in result
+
+
+def test_attendance_summary_aggregates_a_past_month_and_an_explicit_day(db):
+    """Ignoring the requested period would answer every historical question with today's numbers."""
+    from app.assistant.adapters import install_production_adapters
+
+    db.add(Department(id="dept-a", name="研发", code="RND"))
+    db.add_all([
+        User(id="employee-a", username="alice", password_encrypted="secret", role="employee", department_id="dept-a"),
+        User(id="employee-b", username="bob", password_encrypted="secret", role="employee", department_id="dept-a"),
+        UserDepartment(user_id="employee-a", department_id="dept-a", is_primary=True),
+        UserDepartment(user_id="employee-b", department_id="dept-a", is_primary=True),
+        EmployeeProfile(user_id="employee-a", full_name="Alice", status="active"),
+        EmployeeProfile(user_id="employee-b", full_name="Bob", status="active"),
+        AttendanceRecord(user_id="employee-a", attendance_date=date(2026, 7, 1), status="present", recorded_by="root"),
+        AttendanceRecord(user_id="employee-a", attendance_date=date(2026, 7, 2), status="late", recorded_by="root"),
+        AttendanceRecord(user_id="employee-b", attendance_date=date(2026, 7, 2), status="present", recorded_by="root"),
+        AttendanceRecord(user_id="employee-a", attendance_date=date(2026, 8, 3), status="absent", recorded_by="root"),
+    ])
+    db.flush()
+    install_production_adapters()
+
+    month = _adapter("attendance_summary")(
+        db,
+        _principal(user_id="root"),
+        _payload("attendance_summary", month="2026-07"),
+    )
+
+    assert month == {
+        "month": "2026-07",
+        "period_start": "2026-07-01",
+        "period_end": "2026-07-31",
+        "active_employees": 2,
+        "records": 3,
+        "days_recorded": 2,
+        "employees_recorded": 2,
+        "status_counts": {"present": 2, "late": 1, "absent": 0, "remote": 0},
+    }
+
+    day = _adapter("attendance_summary")(
+        db,
+        _principal(user_id="root"),
+        _payload("attendance_summary", attendance_date="2026-08-03"),
+    )
+
+    assert day == {
+        "date": "2026-08-03",
+        "active_employees": 2,
+        "recorded": 1,
+        "missing": 1,
+        "status_counts": {"present": 0, "late": 0, "absent": 1, "remote": 0},
+    }
+
+
+def test_attendance_summary_rejects_both_period_fields_and_an_invalid_month():
+    """Accepting a day and a month together would make the aggregate ambiguous."""
+    from pydantic import ValidationError
+
+    from app.assistant.registry import get_action
+
+    action = get_action("attendance_summary")
+    assert action is not None
+    with pytest.raises(ValidationError):
+        action.input_model.model_validate({"attendance_date": "2026-08-03", "month": "2026-08"})
+    with pytest.raises(ValidationError):
+        action.input_model.model_validate({"month": "2026-13-01"})
+    with pytest.raises(ValidationError):
+        action.input_model.model_validate({"month": "2026-08", "start_date": "2026-08-01", "end_date": "2026-08-07"})
+    with pytest.raises(ValidationError):
+        action.input_model.model_validate({"start_date": "2026-08-07"})
+    with pytest.raises(ValidationError):
+        action.input_model.model_validate({"start_date": "2026-08-07", "end_date": "2026-08-01"})
+
+    expense = get_action("expense_summary")
+    assert expense is not None
+    with pytest.raises(ValidationError):
+        expense.input_model.model_validate({"month": "2026-08", "start_date": "2026-08-01", "end_date": "2026-08-07"})
+    with pytest.raises(ValidationError):
+        expense.input_model.model_validate({"start_date": "2024-01-01", "end_date": "2026-01-01"})
+
+
+def test_summaries_aggregate_an_explicit_date_range(db):
+    """A week question answered with a month would report the wrong total as exact."""
+    from app.assistant.adapters import install_production_adapters
+
+    db.add(Department(id="dept-a", name="研发", code="RND"))
+    db.add_all([
+        User(id="employee-a", username="alice", password_encrypted="secret", role="employee", department_id="dept-a"),
+        UserDepartment(user_id="employee-a", department_id="dept-a", is_primary=True),
+        EmployeeProfile(user_id="employee-a", full_name="Alice", status="active"),
+        AttendanceRecord(user_id="employee-a", attendance_date=date(2026, 8, 24), status="present", recorded_by="root"),
+        AttendanceRecord(user_id="employee-a", attendance_date=date(2026, 8, 31), status="late", recorded_by="root"),
+        ExpenseClaim(
+            id="claim-in-range",
+            claim_no="EXP-RANGE-IN",
+            requester_id="employee-a",
+            department_id="dept-a",
+            title="周内打车",
+            purpose="客户拜访",
+            total_amount=Decimal("120.00"),
+            status="paid",
+            created_at=datetime(2026, 8, 25, 2, 0, tzinfo=UTC),
+        ),
+        ExpenseClaim(
+            id="claim-out-of-range",
+            claim_no="EXP-RANGE-OUT",
+            requester_id="employee-a",
+            department_id="dept-a",
+            title="月内其他",
+            purpose="其他",
+            total_amount=Decimal("300.00"),
+            status="paid",
+            created_at=datetime(2026, 8, 31, 2, 0, tzinfo=UTC),
+        ),
+    ])
+    db.flush()
+    install_production_adapters()
+
+    attendance = _adapter("attendance_summary")(
+        db,
+        _principal(user_id="root"),
+        _payload("attendance_summary", start_date="2026-08-24", end_date="2026-08-30"),
+    )
+    assert attendance["period_start"] == "2026-08-24"
+    assert attendance["period_end"] == "2026-08-30"
+    assert attendance["records"] == 1
+    assert "month" not in attendance
+
+    expenses = _adapter("expense_summary")(
+        db,
+        _principal(user_id="employee-a", role="employee", department_ids=("dept-a",)),
+        _payload("expense_summary", start_date="2026-08-24", end_date="2026-08-30"),
+    )
+    assert expenses["period_start"] == "2026-08-24"
+    assert expenses["period_end"] == "2026-08-30"
+    assert expenses["count"] == 1
+    assert expenses["amount"] == "120.00"
+    assert "month" not in expenses
+
+
+def test_employee_attendance_summary_never_includes_a_colleague(db):
+    from app.assistant.adapters import install_production_adapters
+
+    today = date.today()
+    db.add(Department(id="dept-a", name="研发", code="RND"))
+    db.add_all([
+        User(id="employee-a", username="alice", password_encrypted="secret", role="employee", department_id="dept-a"),
+        User(id="employee-b", username="bob", password_encrypted="secret", role="employee", department_id="dept-a"),
+        EmployeeProfile(user_id="employee-a", full_name="Alice", status="active"),
+        EmployeeProfile(user_id="employee-b", full_name="Bob", status="active"),
+        AttendanceRecord(user_id="employee-a", attendance_date=today, status="remote", recorded_by="employee-a"),
+        AttendanceRecord(user_id="employee-b", attendance_date=today, status="late", recorded_by="employee-b"),
+    ])
+    db.flush()
+    install_production_adapters()
+
+    result = _adapter("attendance_summary")(
+        db,
+        _principal(user_id="employee-a", role="employee", department_ids=("dept-a",)),
+        _payload("attendance_summary"),
+    )
+
+    assert result == {
+        "date": today.isoformat(),
+        "active_employees": 1,
+        "recorded": 1,
+        "missing": 0,
+        "status_counts": {"present": 0, "late": 0, "absent": 0, "remote": 1},
+    }
+
+
+def test_employee_expense_summary_contains_only_own_month(db):
+    from app.assistant.adapters import install_production_adapters
+
+    db.add(Department(id="dept-a", name="研发", code="RND"))
+    db.add_all([
+        User(id="employee", username="employee", password_encrypted="secret", role="employee", department_id="dept-a"),
+        User(id="colleague", username="colleague", password_encrypted="secret", role="employee", department_id="dept-a"),
+        ExpenseClaim(
+            id="own-expense",
+            claim_no="EXP-OWN",
+            requester_id="employee",
+            department_id="dept-a",
+            title="本人交通费",
+            total_amount=Decimal("86.00"),
+            status="draft",
+            created_at=datetime(2026, 9, 1, 2, 0, tzinfo=UTC),
+        ),
+        ExpenseClaim(
+            id="peer-expense",
+            claim_no="EXP-PEER",
+            requester_id="colleague",
+            department_id="dept-a",
+            title="同事费用",
+            total_amount=Decimal("999.00"),
+            status="paid",
+            created_at=datetime(2026, 9, 1, 3, 0, tzinfo=UTC),
+        ),
+    ])
+    db.flush()
+    install_production_adapters()
+
+    result = _adapter("expense_summary")(
+        db,
+        _principal(user_id="employee", role="employee", department_ids=("dept-a",)),
+        _payload("expense_summary", month="2026-09"),
+    )
+
+    assert result == {
+        "month": "2026-09",
+        "period_start": "2026-09-01",
+        "period_end": "2026-09-30",
+        "count": 1,
+        "amount": "86.00",
+        "status_counts": {
+            "draft": 1,
+            "pending_approval": 0,
+            "rejected": 0,
+            "payment_pending": 0,
+            "paid": 0,
+            "cancelled": 0,
+        },
+        "route_key": "expenses",
+    }
+
+
+@pytest.mark.parametrize("month", ["2026-00", "2026-13", "0000-01", "9999-12"])
+def test_expense_summary_rejects_invalid_calendar_months(db, month):
+    from app.assistant.adapters import install_production_adapters
+
+    install_production_adapters()
+
+    with pytest.raises(HTTPException) as exc_info:
+        _adapter("expense_summary")(
+            db,
+            _principal(user_id="employee", role="employee", department_ids=("dept-a",)),
+            _payload("expense_summary", month=month),
+        )
+
+    assert exc_info.value.status_code == 422
+
+
+def test_expense_summary_uses_shanghai_month_utc_boundaries(db):
+    from app.assistant.adapters import install_production_adapters
+
+    db.add(Department(id="dept-a", name="研发", code="RND"))
+    db.add(User(id="employee", username="employee", password_encrypted="secret", role="employee", department_id="dept-a"))
+    db.add_all([
+        ExpenseClaim(
+            id="before-month",
+            claim_no="EXP-BEFORE",
+            requester_id="employee",
+            department_id="dept-a",
+            title="月初前一瞬",
+            total_amount=Decimal("1.00"),
+            status="draft",
+            created_at=datetime(2026, 8, 31, 15, 59, 59, 999999, tzinfo=UTC),
+        ),
+        ExpenseClaim(
+            id="at-month-start",
+            claim_no="EXP-START",
+            requester_id="employee",
+            department_id="dept-a",
+            title="上海九月月初",
+            total_amount=Decimal("10.00"),
+            status="draft",
+            created_at=datetime(2026, 8, 31, 16, 0, tzinfo=UTC),
+        ),
+        ExpenseClaim(
+            id="before-next-month",
+            claim_no="EXP-END",
+            requester_id="employee",
+            department_id="dept-a",
+            title="上海九月末瞬间",
+            total_amount=Decimal("20.00"),
+            status="paid",
+            created_at=datetime(2026, 9, 30, 15, 59, 59, 999999, tzinfo=UTC),
+        ),
+        ExpenseClaim(
+            id="at-next-month",
+            claim_no="EXP-AFTER",
+            requester_id="employee",
+            department_id="dept-a",
+            title="上海十月月初",
+            total_amount=Decimal("100.00"),
+            status="paid",
+            created_at=datetime(2026, 9, 30, 16, 0, tzinfo=UTC),
+        ),
+    ])
+    db.flush()
+    install_production_adapters()
+
+    result = _adapter("expense_summary")(
+        db,
+        _principal(user_id="employee", role="employee", department_ids=("dept-a",)),
+        _payload("expense_summary", month="2026-09"),
+    )
+
+    assert result["count"] == 2
+    assert result["amount"] == "30.00"
+    assert result["status_counts"] == {
+        "draft": 1,
+        "pending_approval": 0,
+        "rejected": 0,
+        "payment_pending": 0,
+        "paid": 1,
+        "cancelled": 0,
     }
 
 
@@ -155,6 +481,61 @@ def test_non_root_cannot_filter_read_actions_to_another_department(db):
         )
 
     assert exc_info.value.status_code == 403
+
+
+def test_non_root_default_department_project_and_contract_lists_stay_in_membership_scope(db):
+    """Omitting default-scope filters would expose another department without an explicit department_id."""
+    from app.assistant.adapters import install_production_adapters
+
+    db.add_all([
+        Department(id="dept-a", name="研发", code="RND"),
+        Department(id="dept-b", name="财务", code="FIN"),
+        Project(id="project-a", code="P-A", name="研发项目", department_id="dept-a"),
+        Project(id="project-b", code="P-B", name="财务项目", department_id="dept-b"),
+        Contract(id="contract-a", code="C-A", name="研发合同", project_id="project-a"),
+        Contract(id="contract-b", code="C-B", name="财务合同", project_id="project-b"),
+    ])
+    db.flush()
+    install_production_adapters()
+    manager = _principal(user_id="manager", role="manager", department_ids=("dept-a",))
+
+    departments = _adapter("list_departments")(db, manager, _payload("list_departments"))
+    projects = _adapter("list_projects")(db, manager, _payload("list_projects"))
+    contracts = _adapter("list_contracts")(db, manager, _payload("list_contracts"))
+
+    assert [item["id"] for item in departments["items"]] == ["dept-a"]
+    assert [item["id"] for item in projects["items"]] == ["project-a"]
+    assert [item["id"] for item in contracts["items"]] == ["contract-a"]
+
+
+def test_root_default_project_and_contract_lists_include_unassigned_and_standalone_objects(db):
+    """Applying department IN filtering to root defaults would silently hide legitimate unassigned objects."""
+    from app.assistant.adapters import install_production_adapters
+
+    db.add_all([
+        Department(id="dept-a", name="研发", code="RND"),
+        Project(id="project-assigned", code="P-A", name="已归属项目", department_id="dept-a"),
+        Project(id="project-unassigned", code="P-U", name="未归属项目", department_id=None),
+        Contract(id="contract-assigned", code="C-A", name="已归属合同", project_id="project-assigned"),
+        Contract(id="contract-unassigned-project", code="C-U", name="未归属项目合同", project_id="project-unassigned"),
+        Contract(id="contract-standalone", code="C-S", name="独立合同", project_id=None),
+    ])
+    db.flush()
+    install_production_adapters()
+    root = _principal(user_id="root", role="admin")
+
+    projects = _adapter("list_projects")(db, root, _payload("list_projects"))
+    contracts = _adapter("list_contracts")(db, root, _payload("list_contracts"))
+
+    assert {item["id"] for item in projects["items"]} == {
+        "project-assigned",
+        "project-unassigned",
+    }
+    assert {item["id"] for item in contracts["items"]} == {
+        "contract-assigned",
+        "contract-unassigned-project",
+        "contract-standalone",
+    }
 
 
 def test_expense_ticket_and_approval_adapters_keep_existing_visibility_boundaries(db):

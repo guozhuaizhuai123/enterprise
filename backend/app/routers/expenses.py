@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
+from app.assistant.form_previews import preview_form
 from app.config import get_settings
 from app.db import get_db
 from app.deps import Principal, get_current_principal
@@ -21,7 +22,6 @@ from app.schemas import (
     PaymentCreate,
     PaymentOut,
 )
-import re
 
 
 router = APIRouter(prefix="/expenses", tags=["expenses"])
@@ -117,63 +117,9 @@ def my_expenses(
     return [_claim_out(db, claim) for claim in claims]
 
 
-def _preview_expense(text: str) -> ExpensePreviewOut:
-    """从自然语言中提取报销意图与字段。"""
-    action = bool(re.search(r"(?:帮我|替我|给我|我要|我想|我需要).{0,30}(?:报销|申请报销|报账|填报销|提报销)", text))
-    if not action and not re.search(r"(?:报销|费用|发票|出差|交通|餐饮|招待)", text):
-        return ExpensePreviewOut(is_expense_request=False)
-
-    title = None
-    for pat in [r"(?:报销|费用)\s*([^\d，,。\s]{2,20})", r"(?:关于|用于)\s*([^\d，,。\s]{2,20})"]:
-        m = re.search(pat, text)
-        if m:
-            title = m.group(1).strip().rstrip("，。")
-            break
-    if not title:
-        title = "费用报销"
-
-    total_amount = None
-    for pat in [r"(\d+(?:\.\d{1,2})?)\s*(?:元|块|CNY|RMB)", r"(?:金额|共|总计|合计).{0,3}(\d+(?:\.\d{1,2})?)"]:
-        m = re.search(pat, text)
-        if m:
-            total_amount = m.group(1)
-            break
-
-    category = None
-    category_keywords = {
-        "交通": ["交通", "打车", "出租车", "地铁", "公交", "高铁", "火车", "机票", "油费", "停车费"],
-        "餐饮": ["餐饮", "吃饭", "餐费", "午餐", "晚餐", "招待", "宴请"],
-        "住宿": ["住宿", "酒店", "宾馆", "旅店"],
-        "办公": ["办公", "文具", "打印", "耗材"],
-        "通讯": ["通讯", "电话", "手机", "宽带", "网络"],
-        "差旅": ["差旅", "出差", "差费"],
-    }
-    for cat, keywords in category_keywords.items():
-        if any(kw in text for kw in keywords):
-            category = cat
-            break
-
-    department_name = None
-    m = re.search(r"([^\s]{1,10}部门)", text)
-    if m:
-        department_name = m.group(1).strip()
-
-    purpose = text.strip()[:200]
-
-    return ExpensePreviewOut(
-        is_expense_request=True,
-        title=title,
-        purpose=purpose,
-        total_amount=total_amount,
-        category=category,
-        department_name=department_name,
-        description=purpose,
-    )
-
-
 @router.post("/preview", response_model=ExpensePreviewOut)
 def expense_preview(payload: ExpensePreviewIn):
-    return _preview_expense(payload.text)
+    return ExpensePreviewOut.model_validate(preview_form("expense", payload.text))
 
 
 @router.post("", response_model=ExpenseClaimOut, status_code=status.HTTP_201_CREATED)

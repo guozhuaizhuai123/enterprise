@@ -71,7 +71,7 @@ class AttendanceHistory:
     attendance_records: tuple[AttendanceRecord, ...]
 
 
-def create_holiday(
+def create_holiday_in_transaction(
     db: Session,
     *,
     name: str,
@@ -120,17 +120,48 @@ def create_holiday(
         created_by=created_by,
     )
     db.add(holiday)
+    db.flush()
+    return holiday
+
+
+def create_holiday(
+    db: Session,
+    *,
+    name: str,
+    scope_type: str,
+    department_id: str | None,
+    start_date: date,
+    end_date: date,
+    description: str,
+    created_by: str,
+) -> HolidayPeriod:
+    """Router-compatible holiday creation wrapper that owns its transaction."""
+    holiday = create_holiday_in_transaction(
+        db,
+        name=name,
+        scope_type=scope_type,
+        department_id=department_id,
+        start_date=start_date,
+        end_date=end_date,
+        description=description,
+        created_by=created_by,
+    )
     db.commit()
     db.refresh(holiday)
     return holiday
 
 
-def delete_holiday(db: Session, holiday: HolidayPeriod) -> None:
+def delete_holiday_in_transaction(db: Session, holiday: HolidayPeriod) -> None:
     db.delete(holiday)
+
+
+def delete_holiday(db: Session, holiday: HolidayPeriod) -> None:
+    """Router-compatible holiday deletion wrapper that owns its transaction."""
+    delete_holiday_in_transaction(db, holiday)
     db.commit()
 
 
-def upsert_attendance(
+def upsert_attendance_in_transaction(
     db: Session,
     *,
     user_id: str,
@@ -162,6 +193,28 @@ def upsert_attendance(
         record.status = status
         record.note = note.strip()
         record.recorded_by = recorded_by
+    db.flush()
+    return record
+
+
+def upsert_attendance(
+    db: Session,
+    *,
+    user_id: str,
+    attendance_date: date,
+    status: str,
+    note: str,
+    recorded_by: str,
+) -> AttendanceRecord:
+    """Router-compatible attendance save wrapper that owns its transaction."""
+    record = upsert_attendance_in_transaction(
+        db,
+        user_id=user_id,
+        attendance_date=attendance_date,
+        status=status,
+        note=note,
+        recorded_by=recorded_by,
+    )
     db.commit()
     db.refresh(record)
     return record
@@ -205,8 +258,13 @@ def create_attendance_once(
     return record
 
 
-def delete_attendance(db: Session, record: AttendanceRecord) -> None:
+def delete_attendance_in_transaction(db: Session, record: AttendanceRecord) -> None:
     db.delete(record)
+
+
+def delete_attendance(db: Session, record: AttendanceRecord) -> None:
+    """Router-compatible attendance deletion wrapper that owns its transaction."""
+    delete_attendance_in_transaction(db, record)
     db.commit()
 
 
@@ -433,7 +491,7 @@ def get_schedule(db: Session, user_id: str) -> list[WorkScheduleDay]:
     return rows if len(rows) == 7 else _default_schedule(user_id)
 
 
-def replace_schedule(
+def replace_schedule_in_transaction(
     db: Session,
     user_id: str,
     days: list[ScheduleDayInput],
@@ -461,8 +519,20 @@ def replace_schedule(
         )
         for day in days
     )
-    db.commit()
+    db.flush()
     return get_schedule(db, user_id)
+
+
+def replace_schedule(
+    db: Session,
+    user_id: str,
+    days: list[ScheduleDayInput],
+    updated_by: str,
+) -> list[WorkScheduleDay]:
+    """Router-compatible schedule replacement wrapper that owns its transaction."""
+    rows = replace_schedule_in_transaction(db, user_id, days, updated_by)
+    db.commit()
+    return rows
 
 
 def _date_range(start_date: date, end_date: date):
@@ -477,7 +547,7 @@ def _contains_working_day(db: Session, user_id: str, start_date: date, end_date:
     return any(day.isoweekday() in enabled_weekdays for day in _date_range(start_date, end_date))
 
 
-def create_leave_request(
+def create_leave_request_in_transaction(
     db: Session,
     *,
     user_id: str,
@@ -513,12 +583,34 @@ def create_leave_request(
         reason=reason.strip(),
     )
     db.add(request)
+    db.flush()
+    return request
+
+
+def create_leave_request(
+    db: Session,
+    *,
+    user_id: str,
+    leave_type: str,
+    start_date: date,
+    end_date: date,
+    reason: str,
+) -> LeaveRequest:
+    """Router-compatible leave-request wrapper that owns its transaction."""
+    request = create_leave_request_in_transaction(
+        db,
+        user_id=user_id,
+        leave_type=leave_type,
+        start_date=start_date,
+        end_date=end_date,
+        reason=reason,
+    )
     db.commit()
     db.refresh(request)
     return request
 
 
-def review_leave_request(
+def review_leave_request_in_transaction(
     db: Session,
     *,
     request_id: str,
@@ -535,6 +627,24 @@ def review_leave_request(
     request.status = status
     request.reviewed_by = reviewed_by
     request.reviewed_at = datetime.now(UTC)
+    db.flush()
+    return request
+
+
+def review_leave_request(
+    db: Session,
+    *,
+    request_id: str,
+    status: str,
+    reviewed_by: str,
+) -> LeaveRequest:
+    """Router-compatible leave-review wrapper that owns its transaction."""
+    request = review_leave_request_in_transaction(
+        db,
+        request_id=request_id,
+        status=status,
+        reviewed_by=reviewed_by,
+    )
     db.commit()
     db.refresh(request)
     return request

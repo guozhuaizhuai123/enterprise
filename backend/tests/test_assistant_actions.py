@@ -425,6 +425,7 @@ def test_cancel_action_is_owner_only_and_idempotent(db):
 
 def test_execute_action_fails_closed_without_adapter_and_uses_counting_adapter_once(db, monkeypatch):
     """Calling registry.execute or re-running a terminal action would bypass the explicit fail-closed boundary."""
+    monkeypatch.setattr(assistant_service, "_ACTION_ADAPTERS", {}, raising=False)
     missing = create_preview(db, _principal(), "thread-1", _plan("create_project", {"code": "KB-1", "name": "知识库"}))
     missing_result = assistant_service.confirm_action(db, _principal(), missing.action_id, _confirmation(missing))
 
@@ -434,7 +435,6 @@ def test_execute_action_fails_closed_without_adapter_and_uses_counting_adapter_o
         calls.append(payload)
         return {"created": payload["code"]}
 
-    monkeypatch.setattr(assistant_service, "_ACTION_ADAPTERS", {}, raising=False)
     assistant_service.register_action_adapter("create_project", adapter)
     completed = create_preview(db, _principal(), "thread-1", _plan("create_project", {"code": "KB-2", "name": "协作"}))
     completed_result = assistant_service.confirm_action(db, _principal(), completed.action_id, _confirmation(completed))
@@ -458,6 +458,24 @@ def test_low_risk_action_executes_without_confirmation(db, monkeypatch):
 
     assert result.status == "completed"
     assert result.result == {"items": []}
+
+
+def test_low_risk_query_executes_without_persisting_a_preview(db, monkeypatch):
+    """Live reads should not create a confirmation row merely to return safe data."""
+    monkeypatch.setattr(assistant_service, "_ACTION_ADAPTERS", {}, raising=False)
+    assistant_service.register_action_adapter(
+        "list_projects",
+        lambda db, principal, payload: {"items": [{"id": "project-1"}], "count": 1},
+    )
+
+    result = assistant_service.execute_low_risk_query(
+        db,
+        _principal(),
+        _plan("list_projects", {}),
+    )
+
+    assert result == {"items": [{"id": "project-1"}], "count": 1}
+    assert db.query(AssistantAction).count() == 0
 
 
 def test_execute_action_rechecks_high_risk_confirmation_phrase(db, monkeypatch):

@@ -1,4 +1,5 @@
 import json
+import re
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sse_starlette.sse import EventSourceResponse
@@ -9,10 +10,17 @@ from app.access import resolve_department_scope
 from app.db import SessionLocal, get_db
 from app.deps import Principal, get_current_principal
 from app.models import Department, Document, Message, SensitiveKeyword, Thread, UserChatSetting
-from app.assistant.adapters import install_production_adapters
-from app.assistant.planner import ActionPlan, plan_input
-from app.assistant.service import cancel_action, confirm_action, create_preview
-from app.assistant.schemas import ActionConfirmRequest
+from app.assistant.form_previews import preview_form
+from app.assistant.intent_extractor import plan_conversation
+from app.assistant.planner import (
+    ActionPlan,
+    ClarificationPlan,
+    FormPreviewPlan,
+    KnowledgePlan,
+    NavigationPlan,
+)
+from app.assistant.service import cancel_action, confirm_action, create_preview, execute_low_risk_query
+from app.assistant.schemas import ActionConfirmRequest, BusinessEvent
 from app.context.service import (
     ensure_thread_context_setting,
     get_thread_context,
@@ -24,6 +32,128 @@ from app.context.service import (
 from app.schemas import AskRequest, MessageOut, ThreadContextOut, ThreadContextUpdate, ThreadOut
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+
+
+_ROUTE_LABELS = {
+    "tickets": "工单中心",
+    "expenses": "费用报销",
+    "organization": "组织管理",
+    "projects": "项目管理",
+    "contracts": "合同管理",
+    "knowledge": "知识库",
+    "schedules": "排班与考勤",
+    "payroll": "薪酬管理",
+    "overview": "企业全景",
+    "assistant": "管理助手",
+}
+_FORM_LABELS = {"leave": "请假", "ticket": "工单", "expense": "报销"}
+_INLINE_SECRET_VALUE_PATTERNS = (
+    re.compile(r"((?:密码|口令)\s*(?:是|为|=|:|：)\s*)([^\s,，。；;]{1,128})"),
+    re.compile(
+        r"(?i)(\b(?:password|passwd|pwd)\b\s*(?:(?:is)\s*|[=:：]\s*))([^\s,，。；;]{1,128})"
+    ),
+)
+
+
+def _safe_user_message_content(question: str, plan: ActionPlan | object) -> str:
+    """Keep password-bearing action input out of durable chat history."""
+    content = question
+    for pattern in _INLINE_SECRET_VALUE_PATTERNS:
+        content = pattern.sub(lambda match: f"{match.group(1)}[REDACTED]", content)
+    if isinstance(plan, ActionPlan):
+        for field_name in plan.action.secret_fields:
+            value = getattr(plan.input, field_name, None)
+            if isinstance(value, str) and value:
+                content = content.replace(value, "[REDACTED]")
+    return content
+
+
+def _business_event(
+    node: str,
+    status_value: str,
+    *,
+    intent: str,
+    display: str,
+    payload: dict,
+    route_key: str | None = None,
+    **compatibility: object,
+) -> dict:
+    base = {
+        "node": node,
+        "status": status_value,
+        "kind": "business",
+        "intent": intent,
+        "display": display,
+        "payload": payload,
+    }
+    if route_key is not None:
+        base["route_key"] = route_key
+    overlap = base.keys() & compatibility.keys()
+    if overlap:
+        raise ValueError(f"reserved business event field: {sorted(overlap)[0]}")
+    return BusinessEvent.model_validate({**base, **compatibility}).model_dump(
+        mode="json", exclude_none=True
+    )
+
+
+def _status_count(result: dict, status_name: str) -> int:
+    counts = result.get("status_counts")
+    value = counts.get(status_name) if isinstance(counts, dict) else None
+    return value if isinstance(value, int) else 0
+
+
+def _period_label(result: dict, fallback: str) -> str:
+    if result.get("month"):
+        return str(result["month"])
+    start, end = result.get("period_start"), result.get("period_end")
+    if start and end:
+        return f"{start} 至 {end}"
+    return fallback
+
+
+def _query_summary(intent: str, result: dict) -> str:
+    """Persist the numbers, not a placeholder: chat history is the audit trail."""
+    if intent == "attendance_summary":
+        status_text = (
+            f"正常 {_status_count(result, 'present')}、迟到 {_status_count(result, 'late')}、"
+            f"缺勤 {_status_count(result, 'absent')}、远程 {_status_count(result, 'remote')}。"
+        )
+        if result.get("date"):
+            return (
+                f"{result['date']} 考勤：应出勤 {result.get('active_employees', 0)} 人，"
+                f"已登记 {result.get('recorded', 0)} 人，未登记 {result.get('missing', 0)} 人；" + status_text
+            )
+        return (
+            f"{_period_label(result, '本期')} 考勤：在职员工 {result.get('active_employees', 0)} 人，"
+            f"共 {result.get('records', 0)} 条记录，覆盖 {result.get('days_recorded', 0)} 天、"
+            f"{result.get('employees_recorded', 0)} 人；" + status_text
+        )
+    if intent == "expense_summary":
+        return (
+            f"{_period_label(result, '本月')} 费用：共 {result.get('count', 0)} 笔，"
+            f"合计 ¥{result.get('amount', '0.00')}；"
+            f"草稿 {_status_count(result, 'draft')}、待审批 {_status_count(result, 'pending_approval')}、"
+            f"待付款 {_status_count(result, 'payment_pending')}、已付款 {_status_count(result, 'paid')}。"
+        )
+    count = result.get("count")
+    if isinstance(count, int):
+        return f"查询完成，共找到 {count} 条结果。"
+    return "查询完成，结果已返回。"
+
+
+def _short_business_stream(thread_id: str, event: dict) -> EventSourceResponse:
+    async def events():
+        yield {
+            "event": "message",
+            "data": json.dumps(
+                {"node": "thread", "status": "ready", "thread_id": thread_id},
+                ensure_ascii=False,
+            ),
+        }
+        yield {"event": "message", "data": json.dumps(event, ensure_ascii=False)}
+        yield {"event": "message", "data": "[DONE]"}
+
+    return EventSourceResponse(events())
 
 
 @router.post("/ask")
@@ -77,21 +207,98 @@ async def ask(
     elif not is_new_thread:
         ensure_thread_context_setting(db, thread)
 
-    action_plan = plan_input(payload.question, principal, db)
-    if isinstance(action_plan, ActionPlan):
-        preview = create_preview(db, principal, thread.id, action_plan)
-        db.commit()
-        async def action_events():
-            yield {"event":"message","data":json.dumps({"node":"thread","status":"ready","thread_id":thread.id}, ensure_ascii=False)}
-            yield {"event":"message","data":json.dumps({"node":"action_preview","status":"ready", **preview.model_dump(mode="json")}, ensure_ascii=False)}
-            yield {"event":"message","data":"[DONE]"}
-        return EventSourceResponse(action_events())
-
-    context = get_thread_context(db, thread)
-    scope = resolve_document_scope_state(db, principal=principal, thread=thread)
-    current_message = Message(thread_id=thread.id, role="user", content=payload.question)
+    plan = await plan_conversation(payload.question, principal, db)
+    safe_question = _safe_user_message_content(payload.question, plan)
+    if is_new_thread:
+        thread.title = safe_question[:50]
+    current_message = Message(
+        thread_id=thread.id,
+        role="user",
+        content=safe_question,
+    )
     db.add(current_message)
     db.flush()
+    thread_id = thread.id
+
+    if isinstance(plan, NavigationPlan):
+        label = _ROUTE_LABELS[plan.route_key]
+        summary = f"正在打开{label}。"
+        event = _business_event(
+            "navigation",
+            "ready",
+            intent="navigation",
+            display=summary,
+            payload={"route_key": plan.route_key},
+            route_key=plan.route_key,
+        )
+        db.add(Message(thread_id=thread_id, role="assistant", content=summary))
+        db.commit()
+        return _short_business_stream(thread_id, event)
+
+    if isinstance(plan, FormPreviewPlan):
+        preview = preview_form(plan.form, plan.text)
+        display = f"已整理{_FORM_LABELS[plan.form]}表单预览，请确认内容后再提交。"
+        event = _business_event(
+            "form_preview",
+            "ready",
+            intent="form_preview",
+            display=display,
+            payload={"form": plan.form, "preview": preview},
+            form=plan.form,
+            preview=preview,
+        )
+        db.add(Message(thread_id=thread_id, role="assistant", content=display))
+        db.commit()
+        return _short_business_stream(thread_id, event)
+
+    if isinstance(plan, ActionPlan) and plan.action.risk_level == "low":
+        result = execute_low_risk_query(db, principal, plan)
+        summary = _query_summary(plan.action.name, result)
+        event = _business_event(
+            "query_result",
+            "completed",
+            intent=plan.action.name,
+            display=summary,
+            payload=result,
+            tool_name=plan.action.name,
+            result=result,
+        )
+        db.add(Message(thread_id=thread_id, role="assistant", content=summary))
+        db.commit()
+        return _short_business_stream(thread_id, event)
+
+    if isinstance(plan, ActionPlan):
+        preview = create_preview(db, principal, thread_id, plan)
+        preview_payload = preview.model_dump(mode="json")
+        display = "操作预览已生成，请确认后执行。"
+        event = _business_event(
+            "action_preview",
+            "ready",
+            intent=plan.action.name,
+            display=display,
+            payload=preview_payload,
+            **preview_payload,
+        )
+        db.add(Message(thread_id=thread_id, role="assistant", content=display))
+        db.commit()
+        return _short_business_stream(thread_id, event)
+
+    if isinstance(plan, ClarificationPlan):
+        summary = "请补充要办理的具体业务和必要信息。"
+        event = _business_event(
+            "clarification",
+            "ready",
+            intent="clarification",
+            display=summary,
+            payload={"reason": plan.reason},
+        )
+        db.add(Message(thread_id=thread_id, role="assistant", content=summary))
+        db.commit()
+        return _short_business_stream(thread_id, event)
+
+    assert isinstance(plan, KnowledgePlan)
+    context = get_thread_context(db, thread)
+    scope = resolve_document_scope_state(db, principal=principal, thread=thread)
     history = load_chat_history(
         db,
         thread.id,
@@ -99,7 +306,6 @@ async def ask(
         current_message_id=current_message.id,
     )
     user_memories = load_enabled_user_memories(db, principal.user_id)
-    thread_id = thread.id
     current_message_id = current_message.id
     question = payload.question
 
