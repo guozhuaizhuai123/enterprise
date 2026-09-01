@@ -1,7 +1,10 @@
 import { API_BASE, apiClient } from "./client";
 import { splitSSEBlocks } from "./sse";
 import { useAuthStore } from "../store/auth";
-import type { PipelineEvent, ThreadContextSettings } from "../types";
+import type { AssistantActionResponse, AssistantActionResult, PipelineEvent, ThreadContextSettings } from "../types";
+
+export async function confirmAssistantAction(actionId:string, confirmationPhrase:string, parameterHash:string):Promise<AssistantActionResponse>{ const r=await apiClient.post(`/chat/actions/${actionId}/confirm`,{action_id:actionId,confirmation_phrase:confirmationPhrase,parameter_hash:parameterHash}); return r.data; }
+export async function cancelAssistantAction(actionId:string):Promise<AssistantActionResult>{ const r=await apiClient.post(`/chat/actions/${actionId}/cancel`); return r.data; }
 
 export async function getThreadContextSettings(threadId: string): Promise<ThreadContextSettings> {
   const res = await apiClient.get<ThreadContextSettings>(`/chat/threads/${threadId}/context-settings`);

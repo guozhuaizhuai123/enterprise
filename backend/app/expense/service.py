@@ -5,6 +5,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
 from fastapi import HTTPException, status
+from sqlalchemy import exists, or_, select, true
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -228,22 +229,42 @@ class ExpenseService:
 
     @staticmethod
     def can_view(db: Session, claim: ExpenseClaim, actor_id: str) -> bool:
-        if claim.requester_id == actor_id:
-            return True
-        actor = db.get(User, actor_id)
-        if actor is None:
-            return False
-        if actor.role == "admin":
-            return True
-        profile = db.get(EmployeeProfile, claim.requester_id)
-        if profile and profile.manager_id == actor_id:
-            return True
-        roles = db.query(UserRole).filter(UserRole.user_id == actor_id).all()
-        return any(
-            row.role in {"hr", "finance"}
-            and (row.department_id is None or row.department_id == claim.department_id)
-            for row in roles
+        """Use the same predicate as bounded list reads for one claim."""
+        return (
+            db.query(ExpenseClaim.id)
+            .filter(
+                ExpenseClaim.id == claim.id,
+                ExpenseService.visibility_predicate(db, actor_id),
+            )
+            .first()
+            is not None
         )
+
+    @staticmethod
+    def visibility_predicate(db: Session, actor_id: str):
+        """Return the canonical SQL visibility policy for expense claims.
+
+        Callers can apply this predicate to a bounded list query; ``can_view``
+        uses it for a single record so both paths cannot drift.
+        """
+        actor = db.get(User, actor_id)
+        requester_owns_claim = ExpenseClaim.requester_id == actor_id
+        if actor is None:
+            return requester_owns_claim
+        if actor.role == "admin":
+            return true()
+        requester_reports_to_actor = ExpenseClaim.requester_id.in_(
+            select(EmployeeProfile.user_id).where(EmployeeProfile.manager_id == actor_id)
+        )
+        privileged_role_scope = exists().where(
+            UserRole.user_id == actor_id,
+            UserRole.role.in_(("hr", "finance")),
+            or_(
+                UserRole.department_id.is_(None),
+                UserRole.department_id == ExpenseClaim.department_id,
+            ),
+        )
+        return or_(requester_owns_claim, requester_reports_to_actor, privileged_role_scope)
 
     @staticmethod
     def _is_finance(db: Session, actor_id: str, department_id: str | None) -> bool:

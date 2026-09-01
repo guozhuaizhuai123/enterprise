@@ -5,6 +5,17 @@ export function formatDashboardMoney(value: string): string {
   return `¥${grouped}.${(rawFraction + "00").slice(0, 2)}`;
 }
 
+function localDate(value: Date): string {
+  return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
+}
+
+export function initialDashboardDateRange(now: Date): { start: string; end: string } {
+  return {
+    start: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`,
+    end: localDate(now),
+  };
+}
+
 export interface DashboardExpenseLinkFilters {
   status?: string;
   start?: string;

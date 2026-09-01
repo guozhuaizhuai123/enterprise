@@ -36,3 +36,13 @@ assertEqual(
   matchesExpenseDateScope("2026-09-01T00:00:00Z", { start: "2026-08-01", end: "2026-08-31" }),
   false,
 );
+
+const dashboardFormat = await import("./dashboardFormat.ts");
+const initialDashboardDateRange = (dashboardFormat as {
+  initialDashboardDateRange?: (now: Date) => { start: string; end: string };
+}).initialDashboardDateRange;
+const localMorning = new Date(2026, 8, 1, 0, 30, 0);
+const range = initialDashboardDateRange?.(localMorning);
+if (JSON.stringify(range) !== JSON.stringify({ start: "2026-09-01", end: "2026-09-01" })) {
+  throw new Error(`Expected a valid local date range, got ${JSON.stringify(range)}`);
+}

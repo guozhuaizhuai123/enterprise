@@ -36,6 +36,8 @@ class SecurityConfigTest(unittest.TestCase):
         defaults = Settings(_env_file=None)
         self.assertEqual(defaults.llm_base_url, "https://api.openai.com/v1")
         self.assertEqual(defaults.llm_model, "gpt-4.1-mini")
+        self.assertEqual(defaults.bootstrap_admin_username, "admin")
+        self.assertEqual(defaults.bootstrap_admin_password, "admin123")
 
         settings = Settings(
             _env_file=None,

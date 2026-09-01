@@ -49,6 +49,8 @@ def on_startup() -> None:
 
     get_settings().require_runtime_secrets()
     init_db()
+    from app.assistant.adapters import install_production_adapters
+    install_production_adapters()
     thread = threading.Thread(target=_payroll_loop, name="payroll-scheduler", daemon=True)
     thread.start()
 

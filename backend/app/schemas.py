@@ -4,6 +4,15 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.assistant.schemas import (
+    ActionChange,
+    ActionConfirmRequest,
+    ActionPreview,
+    ActionResult,
+    ActionRisk,
+    ActionStatus,
+)
+
 
 class LoginRequest(BaseModel):
     username: str

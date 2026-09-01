@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.deps import Principal, require_admin
+from app.governance.service import GovernanceService
 from app.kb import service as kb_service
 from app.models import Contract, Department, Document, Project, SensitiveEvent, SensitiveKeyword, User, UserDepartment
 from app.schemas import (
@@ -305,11 +306,15 @@ def list_sensitive_events(db: Session = Depends(get_db)):
 
 
 @router.delete("/sensitive-events/{event_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_sensitive_event(event_id: str, db: Session = Depends(get_db)):
+def delete_sensitive_event(
+    event_id: str,
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(require_admin),
+):
     event = db.get(SensitiveEvent, event_id)
     if event is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "sensitive event not found")
-    db.delete(event)
+    GovernanceService.delete_sensitive_event(db, event, principal)
     db.commit()
 
 
@@ -324,13 +329,7 @@ def create_sensitive_keyword(
     db: Session = Depends(get_db),
     principal: Principal = Depends(require_admin),
 ):
-    keyword = payload.keyword.strip()
-    if not keyword:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "keyword cannot be empty")
-    if db.query(SensitiveKeyword).filter(SensitiveKeyword.keyword == keyword).first():
-        raise HTTPException(status.HTTP_409_CONFLICT, "keyword already exists")
-    item = SensitiveKeyword(keyword=keyword, enabled=payload.enabled, updated_by=principal.user_id)
-    db.add(item)
+    item = GovernanceService.create_sensitive_keyword(db, payload, principal)
     db.commit()
     db.refresh(item)
     return item
@@ -346,32 +345,22 @@ def update_sensitive_keyword(
     item = db.get(SensitiveKeyword, keyword_id)
     if item is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "keyword not found")
-    if payload.keyword is not None:
-        keyword = payload.keyword.strip()
-        if not keyword:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "keyword cannot be empty")
-        duplicate = (
-            db.query(SensitiveKeyword)
-            .filter(SensitiveKeyword.keyword == keyword, SensitiveKeyword.id != keyword_id)
-            .first()
-        )
-        if duplicate:
-            raise HTTPException(status.HTTP_409_CONFLICT, "keyword already exists")
-        item.keyword = keyword
-    if payload.enabled is not None:
-        item.enabled = payload.enabled
-    item.updated_by = principal.user_id
+    GovernanceService.update_sensitive_keyword(db, item, payload, principal)
     db.commit()
     db.refresh(item)
     return item
 
 
 @router.delete("/sensitive-keywords/{keyword_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_sensitive_keyword(keyword_id: str, db: Session = Depends(get_db)):
+def delete_sensitive_keyword(
+    keyword_id: str,
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(require_admin),
+):
     item = db.get(SensitiveKeyword, keyword_id)
     if item is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "keyword not found")
-    db.delete(item)
+    GovernanceService.delete_sensitive_keyword(db, item, principal)
     db.commit()
 
 
@@ -402,6 +391,8 @@ def create_document(
         project_id=project_id,
         contract_id=contract_id,
     )
+    db.commit()
+    db.refresh(doc)
     return _document_out(doc, detail=True)
 
 
@@ -438,9 +429,9 @@ def update_document(document_id: str, payload: DocumentUpdate, db: Session = Dep
         content=payload.content,
         owner_id=payload.owner_id,
         owner_name=owner_name,
+        project_id=next_project_id,
+        contract_id=next_contract_id,
     )
-    doc.project_id = next_project_id
-    doc.contract_id = next_contract_id
     db.commit()
     db.refresh(doc)
     return _document_out(doc, detail=True)
@@ -450,3 +441,4 @@ def update_document(document_id: str, payload: DocumentUpdate, db: Session = Dep
 def delete_document(document_id: str, db: Session = Depends(get_db)):
     doc = _document_or_404(db, document_id)
     kb_service.delete_document(db, doc)
+    db.commit()

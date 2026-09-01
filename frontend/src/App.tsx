@@ -11,6 +11,8 @@ import AdminTicketsPage from "./pages/AdminTicketsPage";
 import OrganizationPage from "./pages/OrganizationPage";
 import ExpensePage from "./pages/ExpensePage";
 import AdminDashboardPage from "./pages/AdminDashboardPage";
+import AdminAssistantPage from "./pages/AdminAssistantPage";
+import EnterpriseOverviewPage from "./pages/EnterpriseOverviewPage";
 import AdminProjectsPage from "./pages/AdminProjectsPage";
 import AdminContractsPage from "./pages/AdminContractsPage";
 import AdminProjectWorkspacePage from "./pages/AdminProjectWorkspacePage";
@@ -39,7 +41,9 @@ export default function App() {
             <Route path="organization" element={<OrganizationPage />} />
             <Route path="approvals" element={<Navigate to="/admin/expenses?status=pending_approval" replace />} />
             <Route path="expenses" element={<ExpensePage />} />
-            <Route path="dashboard" element={<AdminDashboardPage />} />
+            <Route path="assistant" element={<AdminAssistantPage />} />
+            <Route path="overview" element={<EnterpriseOverviewPage />} />
+            <Route path="dashboard" element={<Navigate to="/admin/overview" replace />} />
             <Route path="projects" element={<AdminProjectsPage />} />
             <Route path="projects/:projectId" element={<AdminProjectWorkspacePage />} />
             <Route path="contracts" element={<AdminContractsPage />} />

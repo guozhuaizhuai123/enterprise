@@ -4,6 +4,7 @@ import { useAuthStore } from "../store/auth";
 import BackButton from "../components/BackButton";
 import AccountSwitcher from "../components/AccountSwitcher";
 import { usePolling } from "../hooks/usePolling";
+import { primaryAdminRoutes } from "../adminNavigation";
 import { listNotifications, listTodos, markAllNotificationsRead, markNotificationRead } from "../api/tickets";
 import type { Notification } from "../types";
 
@@ -13,11 +14,6 @@ interface NavItem {
   /** 重要消息数量徽标：>0 时在该导航项上高亮提示。 */
   badge?: number;
   end?: boolean;
-}
-
-interface NavGroup {
-  label: string;
-  items: NavItem[];
 }
 
 function navClass(isActive: boolean): string {
@@ -104,65 +100,38 @@ export default function AdminLayout() {
     void refreshNow();
   }, [location.pathname, refreshNow]);
 
-  const groups: NavGroup[] = [
-    {
-      label: "工作台",
-      items: [{ to: "/admin/dashboard", label: "管理驾驶舱" }],
-    },
-    {
-      label: "组织人事",
-      items: [
-        { to: "/admin", label: "部门管理", end: true },
-        { to: "/admin/organization", label: "组织与员工" },
-        { to: "/admin/work-schedules", label: "排班管理" },
-        { to: "/admin/payroll", label: "薪酬与发薪" },
-      ],
-    },
-    {
-      label: "协作工单",
-      items: [{ to: "/admin/tickets", label: "工单与待办", badge: counts.todos }],
-    },
-    { label: "财务管理", items: [{ to: "/admin/expenses", label: "费用报销" }] },
-    {
-      label: "数据监控",
-      items: [{ to: "/admin/sensitive-events", label: "敏感记录" }],
-    },
-    {
-      label: "经营资产",
-      items: [
-        { to: "/admin/projects", label: "项目工作台" },
-        { to: "/admin/contracts", label: "合同台账" },
-        { to: "/admin/knowledge", label: "知识文档" },
-      ],
-    },
-  ];
+  const primaryItems: NavItem[] = primaryAdminRoutes();
 
   return (
     <div className="min-h-screen bg-slate-50">
       <header className="sticky top-0 z-20 border-b border-slate-200 bg-white">
         <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 px-6 py-3">
           <div className="flex items-center gap-5">
-            <BackButton fallback="/admin" />
+            <BackButton fallback="/admin/assistant" />
             <span className="whitespace-nowrap font-semibold text-slate-900">
               企业智能检索系统 · 管理后台
             </span>
-            <nav className="flex flex-wrap items-end gap-x-6 gap-y-2">
-              {groups.map((group) => (
-                <div key={group.label} className="flex flex-col gap-1">
-                  <span className="text-[10px] font-medium uppercase tracking-wider text-slate-400">
-                    {group.label}
-                  </span>
-                  <div className="flex items-center gap-3">
-                    {group.items.map((item) => (
-                      <NavLinkItem key={item.to} item={item} />
-                    ))}
-                  </div>
-                </div>
+            {/* 一级导航只有管理助手与企业全景；其他页面通过助手导航、全景下钻
+                或直接链接进入，路由全部保留。 */}
+            <nav className="flex items-center gap-4">
+              {primaryItems.map((item) => (
+                <NavLinkItem key={item.to} item={item} />
               ))}
             </nav>
           </div>
 
           <div className="flex items-center gap-3">
+            {counts.todos > 0 && (
+              <NavLink
+                to="/admin/tickets"
+                className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2.5 py-1 text-xs text-amber-700 hover:bg-amber-100"
+              >
+                待办
+                <span className="inline-flex min-w-[18px] items-center justify-center rounded-full bg-amber-500 px-1 text-[11px] font-semibold leading-none text-white">
+                  {counts.todos > 99 ? "99+" : counts.todos}
+                </span>
+              </NavLink>
+            )}
             <div className="relative">
               <button
                 onClick={() => setBellOpen((open) => !open)}

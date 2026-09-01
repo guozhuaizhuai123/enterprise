@@ -1,6 +1,13 @@
 import { useEffect, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useAuthStore } from "../store/auth";
-import { askQuestion, getThreadContextSettings, updateThreadContextSettings } from "../api/chat";
+import {
+  askQuestion,
+  cancelAssistantAction,
+  confirmAssistantAction,
+  getThreadContextSettings,
+  updateThreadContextSettings,
+} from "../api/chat";
 import { deleteThread, listMessages, listMyDocuments, listThreads } from "../api/kb";
 import { getChatSettings } from "../api/memory";
 import {
@@ -15,6 +22,8 @@ import { createTicket, listDepartments, listParticipants, previewTicket } from "
 import PipelineFlow, { initialPipelineState, type PipelineState } from "../components/PipelineFlow";
 import MyDocumentsPanel from "../components/MyDocumentsPanel";
 import AnswerContent from "../components/AnswerContent";
+import AssistantActionCard from "../components/AssistantActionCard";
+import AssistantResultCard from "../components/AssistantResultCard";
 import ChatContextToolbar from "../components/ChatContextToolbar";
 import DocumentScopeDialog from "../components/DocumentScopeDialog";
 import { getThreadStateAfterDeletion } from "../threadDeletion";
@@ -29,10 +38,18 @@ import WorkScheduleCard from "../components/WorkScheduleCard";
 import AttendanceHistoryDialog from "../components/AttendanceHistoryDialog";
 import AttendanceCheckinDialog from "../components/AttendanceCheckinDialog";
 import { DEFAULT_MEMORY_LEVEL } from "../chatContext";
-import { formatLeaveRange, shouldPreviewLeave } from "../scheduleFormat";
+import { formatLeaveRange } from "../scheduleFormat";
 import { decideAttendanceGate, shouldRefreshWorkSchedule } from "../attendanceGate";
-import { shouldPreviewExpense, shouldPreviewTicket } from "../chatIntent";
+import { routeForKey, type AssistantResultPresentation } from "../assistantPresentation";
+import {
+  decideChatPageOutcome,
+  fallbackFormForQuestion,
+  type ChatFormKind,
+  type ChatFormPreview,
+} from "../chatBusinessIntent";
 import type {
+  AssistantActionPreview,
+  AssistantActionResult,
   AttendanceStatus,
   Citation,
   Department,
@@ -58,6 +75,8 @@ interface ChatMessage {
   citations: Citation[];
   streaming?: boolean;
   verificationWarning?: string;
+  result?: AssistantResultPresentation;
+  action?: AssistantActionPreview;
 }
 
 interface ActiveAskRequest {
@@ -68,6 +87,12 @@ interface ActiveAskRequest {
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const FORM_LABELS: Record<ChatFormKind, string> = {
+  leave: "请假",
+  ticket: "工单",
+  expense: "报销",
+};
 
 function newThreadContext(memoryLevel: MemoryLevel = DEFAULT_MEMORY_LEVEL): ThreadContextSettings {
   return {
@@ -108,8 +133,6 @@ export default function ChatPage() {
   const [memoryOpen, setMemoryOpen] = useState(false);
   const [workSchedule, setWorkSchedule] = useState<MyWorkSchedule | null>(null);
   const [leavePreview, setLeavePreview] = useState<LeavePreview | null>(null);
-  const [leaveQuestion, setLeaveQuestion] = useState("");
-  const [previewingLeave, setPreviewingLeave] = useState(false);
   const [submittingLeave, setSubmittingLeave] = useState(false);
   const [attendanceHistoryOpen, setAttendanceHistoryOpen] = useState(false);
   const [attendanceHistoryVersion, setAttendanceHistoryVersion] = useState(0);
@@ -120,15 +143,16 @@ export default function ChatPage() {
   const [attendanceError, setAttendanceError] = useState("");
   const [leaveError, setLeaveError] = useState("");
   const [ticketPreview, setTicketPreview] = useState<TicketPreview | null>(null);
-  const [ticketQuestion, setTicketQuestion] = useState("");
   const [submittingTicket, setSubmittingTicket] = useState(false);
   const [ticketError, setTicketError] = useState("");
   const [expensePreview, setExpensePreview] = useState<ExpensePreview | null>(null);
-  const [expenseQuestion, setExpenseQuestion] = useState("");
   const [submittingExpense, setSubmittingExpense] = useState(false);
   const [expenseError, setExpenseError] = useState("");
   const [participants, setParticipants] = useState<UserOption[]>([]);
   const [allDepartments, setAllDepartments] = useState<Department[]>([]);
+  const [actionResults, setActionResults] = useState<Record<string, AssistantActionResult>>({});
+  const [actionBusyId, setActionBusyId] = useState<string | null>(null);
+  const navigate = useNavigate();
   const bottomRef = useRef<HTMLDivElement>(null);
   const threadIdRef = useRef<string | null>(null);
   const threadLoadVersionRef = useRef(0);
@@ -321,7 +345,7 @@ export default function ChatPage() {
 
   async function handleAsk() {
     const question = input.trim();
-    if (!question || activeAskRef.current !== null || savingContext || loadingContext || previewingLeave || submittingLeave || checkingAttendance || submittingAttendance || submittingTicket || submittingExpense) return;
+    if (!question || activeAskRef.current !== null || savingContext || loadingContext || submittingLeave || checkingAttendance || submittingAttendance || submittingTicket || submittingExpense) return;
     setCheckingAttendance(true);
     setContextError("");
     try {
@@ -340,65 +364,104 @@ export default function ChatPage() {
     await processQuestion(question);
   }
 
+  // 后端的对话规划层已经决定了这句话属于知识问答、实时查询、表单预填、页面
+  // 导航还是受控动作，所以这里不再抢先发三个 preview 请求；只有后端完全没有
+  // 给出业务事件时（例如旧版本后端）才退回本地规则。
   async function processQuestion(question: string) {
-    if (shouldPreviewLeave(question)) {
-      setPreviewingLeave(true);
-      setContextError("");
-      try {
+    const sawBusinessEvent = await askKnowledgeQuestion(question);
+    if (sawBusinessEvent) return;
+    await runFallbackFormPreview(question);
+  }
+
+  async function runFallbackFormPreview(question: string) {
+    const form = fallbackFormForQuestion(question);
+    if (form === null) return;
+    try {
+      if (form === "leave") {
         const preview = await previewLeave(question);
-        if (preview.is_leave_request) {
-          setLeaveQuestion(question);
-          setLeavePreview(preview);
-          setLeaveError("");
-          return;
-        }
-      } catch {
-        setContextError("请假信息识别失败，请稍后重试");
+        if (!preview.is_leave_request) return;
+        setLeavePreview(preview);
+        setLeaveError("");
         return;
-      } finally {
-        setPreviewingLeave(false);
       }
-    }
-
-    if (shouldPreviewTicket(question)) {
-      setSubmittingTicket(true);
-      setContextError("");
-      try {
-        const preview = await previewTicket(question);
-        if (preview.is_ticket_request) {
-          setTicketQuestion(question);
-          setTicketPreview(preview);
-          setTicketError("");
-          return;
-        }
-      } catch {
-        setContextError("工单信息识别失败，请稍后重试");
-        return;
-      } finally {
-        setSubmittingTicket(false);
-      }
-    }
-
-    if (shouldPreviewExpense(question)) {
-      setSubmittingExpense(true);
-      setContextError("");
-      try {
+      if (form === "expense") {
         const preview = await previewExpense(question);
-        if (preview.is_expense_request) {
-          setExpenseQuestion(question);
-          setExpensePreview(preview);
-          setExpenseError("");
-          return;
-        }
-      } catch {
-        setContextError("报销信息识别失败，请稍后重试");
+        if (!preview.is_expense_request) return;
+        setExpensePreview(preview);
+        setExpenseError("");
         return;
-      } finally {
-        setSubmittingExpense(false);
       }
+      const preview = await previewTicket(question);
+      if (!preview.is_ticket_request) return;
+      setTicketPreview(preview);
+      setTicketError("");
+    } catch {
+      // 兜底路径失败时保留已经给出的知识回答，不覆盖聊天内容
     }
+  }
 
-    await askKnowledgeQuestion(question);
+  function updateAssistantMessage(assistantId: string, patch: Partial<ChatMessage>) {
+    setMessages((current) =>
+      current.map((message) => (message.id === assistantId ? { ...message, ...patch } : message)),
+    );
+  }
+
+  function openFormDialog(form: ChatFormKind, preview: ChatFormPreview) {
+    if (form === "leave") {
+      setLeavePreview(preview as LeavePreview);
+      setLeaveError("");
+      return;
+    }
+    if (form === "ticket") {
+      setTicketPreview(preview as TicketPreview);
+      setTicketError("");
+      return;
+    }
+    setExpensePreview(preview as ExpensePreview);
+    setExpenseError("");
+  }
+
+  async function confirmChatAction(action: AssistantActionPreview) {
+    if (actionBusyId !== null) return;
+    setActionBusyId(action.action_id);
+    try {
+      const response = await confirmAssistantAction(
+        action.action_id,
+        action.confirmation_phrase || "确认执行",
+        action.parameter_hash || "",
+      );
+      if ("status" in response) {
+        setActionResults((current) => ({ ...current, [action.action_id]: response as AssistantActionResult }));
+        if ((response as AssistantActionResult).status === "completed") {
+          setContextNotice("操作已执行完成");
+        }
+      } else {
+        setMessages((current) =>
+          current.map((message) =>
+            message.action?.action_id === action.action_id
+              ? { ...message, action: response as AssistantActionPreview }
+              : message,
+          ),
+        );
+      }
+    } catch {
+      setContextError("操作执行失败，请重新发起");
+    } finally {
+      setActionBusyId(null);
+    }
+  }
+
+  async function cancelChatAction(action: AssistantActionPreview) {
+    if (actionBusyId !== null) return;
+    setActionBusyId(action.action_id);
+    try {
+      const result = await cancelAssistantAction(action.action_id);
+      setActionResults((current) => ({ ...current, [action.action_id]: result }));
+    } catch {
+      setContextError("操作取消失败，请稍后重试");
+    } finally {
+      setActionBusyId(null);
+    }
   }
 
   async function submitTodayAttendance(status: AttendanceStatus, note: string) {
@@ -435,9 +498,9 @@ export default function ChatPage() {
     try {
       const request = await createLeaveRequest(payload);
       const now = Date.now();
+      // 问题气泡已经在提问时追加过，这里只补充办理结果
       setMessages((current) => [
         ...current,
-        { id: `leave-user-${now}`, role: "user", content: leaveQuestion, citations: [] },
         {
           id: `leave-assistant-${now}`,
           role: "assistant",
@@ -447,7 +510,6 @@ export default function ChatPage() {
       ]);
       setInput("");
       setLeavePreview(null);
-      setLeaveQuestion("");
       setContextNotice("请假申请已提交，管理员批准后会自动同步上班安排");
       setWorkSchedule(await getMyWorkSchedule());
     } catch {
@@ -472,7 +534,6 @@ export default function ChatPage() {
       const now = Date.now();
       setMessages((current) => [
         ...current,
-        { id: `ticket-user-${now}`, role: "user", content: ticketQuestion, citations: [] },
         {
           id: `ticket-assistant-${now}`,
           role: "assistant",
@@ -482,7 +543,6 @@ export default function ChatPage() {
       ]);
       setInput("");
       setTicketPreview(null);
-      setTicketQuestion("");
       setTicketError("");
       setContextNotice("工单已提交，相关人员会收到消息通知");
     } catch {
@@ -500,7 +560,6 @@ export default function ChatPage() {
       const now = Date.now();
       setMessages((current) => [
         ...current,
-        { id: `expense-user-${now}`, role: "user", content: expenseQuestion, citations: [] },
         {
           id: `expense-assistant-${now}`,
           role: "assistant",
@@ -510,7 +569,6 @@ export default function ChatPage() {
       ]);
       setInput("");
       setExpensePreview(null);
-      setExpenseQuestion("");
       setExpenseError("");
       setContextNotice("报销单已创建，请在报销页面提交审批");
     } catch {
@@ -520,11 +578,11 @@ export default function ChatPage() {
     }
   }
 
-  async function askKnowledgeQuestion(question: string) {
+  async function askKnowledgeQuestion(question: string): Promise<boolean> {
     if (contextSettings.document_scope_mode === "selected" && contextSettings.document_ids.length === 0) {
       setContextError("请重新选择文档范围后再提问");
       openDocumentScope();
-      return;
+      return true;
     }
     const askingThreadId = threadId;
     const initialContext = contextSettings;
@@ -547,6 +605,7 @@ export default function ChatPage() {
     setMessages((prev) => [...prev, userMsg, { id: assistantId, role: "assistant", content: "", citations: [], streaming: true }]);
 
     let citationsMeta: Citation[] = [];
+    let sawBusinessEvent = false;
     const eventQueue: PipelineEvent[] = [];
     let draining = false;
 
@@ -560,9 +619,10 @@ export default function ChatPage() {
             break;
           }
           const evt = eventQueue.shift()!;
-          handlePipelineEvent(evt, assistantId, generation, (c) => {
+          const handledAsBusiness = handlePipelineEvent(evt, assistantId, generation, (c) => {
             citationsMeta = c;
           });
+          if (handledAsBusiness) sawBusinessEvent = true;
           const delay = pipelineStepDelay(evt.node as string, evt.status as string);
           if (delay > 0) await sleep(delay);
         }
@@ -608,6 +668,7 @@ export default function ChatPage() {
     }
 
     void citationsMeta;
+    return sawBusinessEvent;
   }
 
   function requestOwnsCurrentView(generation: number): boolean {
@@ -624,22 +685,54 @@ export default function ChatPage() {
     assistantId: string,
     generation: number,
     setCitationsRef: (c: Citation[]) => void,
-  ) {
-    if (!requestOwnsCurrentView(generation)) return;
+  ): boolean {
+    if (!requestOwnsCurrentView(generation)) return false;
     const node = evt.node as string;
     const status = evt.status as string;
 
     if (node === "thread" && status === "ready") {
       const request = activeAskRef.current;
       const readyThreadId = typeof evt.thread_id === "string" ? evt.thread_id : null;
-      if (request === null || readyThreadId === null) return;
+      if (request === null || readyThreadId === null) return false;
       if (request.originThreadId !== null) {
-        return;
+        return false;
       }
       request.readyThreadId = readyThreadId;
       threadIdRef.current = readyThreadId;
       setThreadId(readyThreadId);
-      return;
+      return false;
+    }
+
+    // 统一业务事件：导航、表单预填、实时查询、受控动作、澄清
+    const outcome = decideChatPageOutcome(evt, "employee");
+    if (outcome.kind !== "none") {
+      if (outcome.kind === "navigate") {
+        updateAssistantMessage(assistantId, { content: outcome.notice, streaming: false });
+        navigate(outcome.href);
+        return true;
+      }
+      if (outcome.kind === "form") {
+        updateAssistantMessage(assistantId, {
+          content: `已根据你的描述整理好${FORM_LABELS[outcome.form]}表单，请确认后提交。`,
+          streaming: false,
+        });
+        openFormDialog(outcome.form, outcome.preview);
+        return true;
+      }
+      if (outcome.kind === "action") {
+        updateAssistantMessage(assistantId, {
+          content: outcome.content,
+          streaming: false,
+          action: outcome.preview,
+        });
+        return true;
+      }
+      updateAssistantMessage(assistantId, {
+        content: outcome.content,
+        streaming: false,
+        result: outcome.result,
+      });
+      return true;
     }
 
     if (node === "scope" && status === "adjusted") {
@@ -654,7 +747,7 @@ export default function ChatPage() {
         }));
         setContextNotice(`部分文档已失效，范围已调整为 ${documentIds.length} 份文档`);
       }
-      return;
+      return false;
     }
 
     if (node === "retrieval") {
@@ -662,7 +755,7 @@ export default function ChatPage() {
       setPipeline((prev) =>
         applyRetrievalEvent(prev, status === "running" ? "running" : "done", matchedCount),
       );
-      return;
+      return false;
     }
 
     if (node === "sensitive_gate") {
@@ -676,7 +769,7 @@ export default function ChatPage() {
               : undefined,
         },
       }));
-      return;
+      return false;
     }
 
     if (node === "answer") {
@@ -695,7 +788,7 @@ export default function ChatPage() {
       } else if (status === "done") {
         setPipeline((prev) => ({ ...prev, answer: { status: "done" } }));
       }
-      return;
+      return false;
     }
 
     if (node === "faithfulness_check") {
@@ -717,7 +810,7 @@ export default function ChatPage() {
           ),
         );
       }
-      return;
+      return false;
     }
 
     if (node === "final") {
@@ -742,13 +835,14 @@ export default function ChatPage() {
         openDocumentScope();
       }
     }
+    return false;
   }
 
   const departmentLabels = Object.fromEntries(
     departments.map((department) => [department.id, department.name]),
   );
   const myDepartmentIds = departments.map((department) => department.id);
-  const contextControlsDisabled = asking || savingContext || loadingContext || previewingLeave || submittingLeave || checkingAttendance || submittingAttendance || submittingTicket || submittingExpense;
+  const contextControlsDisabled = asking || savingContext || loadingContext || submittingLeave || checkingAttendance || submittingAttendance || submittingTicket || submittingExpense;
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col">
@@ -808,6 +902,23 @@ export default function ChatPage() {
                   {m.role === "assistant" ? (
                     <>
                       <AnswerContent text={m.content || (m.streaming ? "思考中..." : "")} citations={m.citations} />
+                      {m.result && (
+                        <AssistantResultCard
+                          result={m.result}
+                          href={routeForKey("employee", m.result.routeKey)}
+                        />
+                      )}
+                      {m.action && (
+                        <div className="mt-3">
+                          <AssistantActionCard
+                            action={m.action}
+                            busy={actionBusyId === m.action.action_id}
+                            result={actionResults[m.action.action_id] ?? null}
+                            onConfirm={() => void confirmChatAction(m.action!)}
+                            onCancel={() => void cancelChatAction(m.action!)}
+                          />
+                        </div>
+                      )}
                       {m.verificationWarning && (
                         <div
                           className={`mt-3 rounded-md border px-3 py-2 text-xs leading-relaxed ${
@@ -864,7 +975,7 @@ export default function ChatPage() {
                 disabled={contextControlsDisabled}
                 className="rounded-md bg-indigo-600 text-white px-4 py-2 text-sm font-medium hover:bg-indigo-500 disabled:opacity-60"
               >
-                {asking ? "提问中..." : checkingAttendance ? "检查考勤..." : previewingLeave ? "识别中..." : "发送"}
+                {asking ? "提问中..." : checkingAttendance ? "检查考勤..." : "发送"}
               </button>
             </div>
           </div>
@@ -917,7 +1028,6 @@ export default function ChatPage() {
         onClose={() => {
           if (!submittingTicket) {
             setTicketPreview(null);
-            setTicketQuestion("");
             setTicketError("");
           }
         }}
@@ -931,7 +1041,6 @@ export default function ChatPage() {
         onClose={() => {
           if (!submittingExpense) {
             setExpensePreview(null);
-            setExpenseQuestion("");
             setExpenseError("");
           }
         }}
