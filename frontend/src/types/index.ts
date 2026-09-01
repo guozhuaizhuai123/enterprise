@@ -493,8 +493,25 @@ export interface PipelineEvent {
   status: string;
   [key: string]: unknown;
 }
-export interface AssistantActionPreview { action_id:string; tool_name:string; risk_level:string; summary:string; confirmation_phrase?:string|null; confirmation_step:number; confirmation_steps_required:number; expires_at?:string|null; parameter_hash?:string|null; changes?: Array<{field:string; before?:unknown; after?:unknown}> }
-export interface AssistantActionResult { action_id:string; status:string; result?:Record<string,unknown>|null; error_code?:string|null }
+export interface AssistantActionPreview {
+  action_id: string;
+  tool_name: string;
+  risk_level: string;
+  summary: string;
+  confirmation_phrase?: string | null;
+  confirmation_step: number;
+  confirmation_steps_required: number;
+  expires_at?: string | null;
+  parameter_hash?: string | null;
+  changes?: Array<{ field: string; before?: unknown; after?: unknown }>;
+}
+export interface AssistantActionResult {
+  action_id: string;
+  status: string;
+  result?: Record<string, unknown> | null;
+  error_code?: string | null;
+}
+export type AssistantActionResponse = AssistantActionPreview | AssistantActionResult;
 
 export type TicketType = "same_department" | "cross_department" | "question" | "issue";
 export interface Ticket {

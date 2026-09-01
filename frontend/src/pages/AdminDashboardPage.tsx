@@ -9,7 +9,8 @@ import { listPayrollRuns } from "../api/payroll";
 import AccountSwitcher from "../components/AccountSwitcher";
 import BackButton from "../components/BackButton";
 import DashboardMetric from "../components/DashboardMetric";
-import { buildDashboardExpenseHref, formatDashboardMoney } from "../dashboardFormat";
+import { buildDashboardExpenseHref, formatDashboardMoney, initialDashboardDateRange } from "../dashboardFormat";
+import { overviewAssistantHref } from "../adminNavigation";
 import { formatExpenseStatus } from "../expenseFormat";
 import { usePolling } from "../hooks/usePolling";
 import { useAuthStore } from "../store/auth";
@@ -25,17 +26,13 @@ interface WorkspaceStats {
   payrollStatus: string;
 }
 
-function firstDayOfMonth(): string {
-  const today = new Date();
-  return `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-01`;
-}
-
 export default function AdminDashboardPage() {
+  const [initialRange] = useState(() => initialDashboardDateRange(new Date()));
   const [overview, setOverview] = useState<DashboardOverview | null>(null);
   const [units, setUnits] = useState<OrgUnit[]>([]);
   const [workspaceStats, setWorkspaceStats] = useState<WorkspaceStats | null>(null);
-  const [start, setStart] = useState(firstDayOfMonth());
-  const [end, setEnd] = useState(new Date().toISOString().slice(0, 10));
+  const [start, setStart] = useState(initialRange.start);
+  const [end, setEnd] = useState(initialRange.end);
   const [departmentId, setDepartmentId] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<"" | "permission" | "load">("");
@@ -102,10 +99,10 @@ export default function AdminDashboardPage() {
   });
 
   const content = <main className="mx-auto w-full max-w-7xl p-6">
-    <div className="flex flex-wrap items-start justify-between gap-4"><div><h1 className="text-2xl font-semibold text-slate-900">管理驾驶舱</h1><p className="mt-1 text-sm text-slate-500">聚焦组织规模、费用流向与当前业务积压。</p></div><div className="flex flex-wrap items-center gap-2"><input type="date" className="rounded-md border border-slate-300 px-3 py-2 text-sm" value={start} onChange={(e) => setStart(e.target.value)} /><input type="date" className="rounded-md border border-slate-300 px-3 py-2 text-sm" value={end} onChange={(e) => setEnd(e.target.value)} />{units.length > 0 && <select className="rounded-md border border-slate-300 px-3 py-2 text-sm" value={departmentId} onChange={(e) => setDepartmentId(e.target.value)}><option value="">全部部门</option>{units.map((unit) => <option key={unit.id} value={unit.id}>{unit.name}</option>)}</select>}<button onClick={() => void load()} className="rounded-md bg-indigo-600 px-4 py-2 text-sm text-white">应用</button></div></div>
+    <div className="flex flex-wrap items-start justify-between gap-4"><div><h1 className="text-2xl font-semibold text-slate-900">企业全景</h1><p className="mt-1 text-sm text-slate-500">聚焦组织规模、费用流向与当前业务积压，每个指标都可以继续下钻。</p>{insideAdmin && <Link to={overviewAssistantHref(`这个月支出怎么样（${start} 至 ${end}）`, departmentId || null)} className="mt-2 inline-flex text-sm font-medium text-indigo-600 hover:text-indigo-800">向管理助手提问 →</Link>}</div><div className="flex flex-wrap items-center gap-2"><input type="date" className="rounded-md border border-slate-300 px-3 py-2 text-sm" value={start} onChange={(e) => setStart(e.target.value)} /><input type="date" className="rounded-md border border-slate-300 px-3 py-2 text-sm" value={end} onChange={(e) => setEnd(e.target.value)} />{units.length > 0 && <select className="rounded-md border border-slate-300 px-3 py-2 text-sm" value={departmentId} onChange={(e) => setDepartmentId(e.target.value)}><option value="">全部部门</option>{units.map((unit) => <option key={unit.id} value={unit.id}>{unit.name}</option>)}</select>}<button onClick={() => void load()} className="rounded-md bg-indigo-600 px-4 py-2 text-sm text-white">应用</button></div></div>
 
     {loading && <div className="mt-6 rounded-xl border border-slate-200 bg-white p-12 text-center text-sm text-slate-400">正在汇总经营数据...</div>}
-    {error === "permission" && <div className="mt-6 rounded-xl border border-amber-200 bg-amber-50 p-8 text-center"><p className="font-medium text-amber-800">当前账号没有驾驶舱权限</p><p className="mt-1 text-sm text-amber-600">管理员、人事和财务可按各自数据范围查看。</p></div>}
+    {error === "permission" && <div className="mt-6 rounded-xl border border-amber-200 bg-amber-50 p-8 text-center"><p className="font-medium text-amber-800">当前账号没有企业全景权限</p><p className="mt-1 text-sm text-amber-600">管理员、人事和财务可按各自数据范围查看。</p></div>}
     {error === "load" && <div className="mt-6 rounded-xl border border-red-200 bg-red-50 p-8 text-center"><p className="text-sm text-red-700">数据加载失败</p><button onClick={() => void load()} className="mt-3 text-sm font-medium text-red-700 underline">重试</button></div>}
 
     {!loading && !error && overview && <div className="mt-6 space-y-6">

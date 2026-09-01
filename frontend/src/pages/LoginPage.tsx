@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { fetchMe, login } from "../api/auth";
+import { isLocalDemoHost } from "../loginDemo";
 import { isAccountFresh, useAuthStore, type SavedAccount } from "../store/auth";
 
 export default function LoginPage() {
@@ -60,6 +61,11 @@ export default function LoginPage() {
       <div className="w-full max-w-sm bg-white rounded-xl shadow-sm border border-slate-200 p-8">
         <h1 className="text-xl font-semibold text-slate-900 mb-1">企业智能检索系统</h1>
         <p className="text-sm text-slate-500 mb-6">登录以继续</p>
+        {import.meta.env.DEV && isLocalDemoHost(window.location.hostname) && (
+          <div className="mb-4 rounded-md border border-indigo-100 bg-indigo-50 px-3 py-2 text-sm text-indigo-700">
+            本地演示账号：<span className="font-medium">admin</span> / <span className="font-medium">admin123</span>
+          </div>
+        )}
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
             <label className="block text-sm text-slate-600 mb-1">用户名</label>
